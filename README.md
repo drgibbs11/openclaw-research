@@ -22,6 +22,7 @@ fixtures/*.json         captured live responses, verbatim
 DISCREPANCIES.md        every place the build spec and the live API disagree
 sql/001_schema.sql      DDL
 sql/010_views.sql       v_series_activity, v_taker_bleed, v_screen + diagnostics
+sql/020_prune.sql       snapshot retention — run daily
 lib/kalshi.py           paginated GET client — throttle, backoff, cursor paging
 lib/bleed.py            the taker-bleed metric
 lib/tape.py             shared tape aggregation for Jobs B and C
@@ -63,6 +64,7 @@ harmless on a direct connection.
 | `BACKFILL_SOURCE` | `archive` | `archive` (deep, per-series) or `recent` (live only) |
 | `BACKFILL_EXCLUDE_CATEGORIES` | — | Comma-separated, e.g. `Sports` |
 | `BACKFILL_SKIP_INGEST` | — | Resume straight into phase 2 |
+| `TERMINAL_MIN_VOLUME` | `0` | Set to `1` to skip never-traded settled markets (see Storage) |
 | `CLASSIFY_MODEL` | `claude-sonnet-5` | Job D model |
 
 ## Running
@@ -120,6 +122,45 @@ Verification, neither of which needs a database:
 python tools/smoke_test.py     # client + mappers vs. the live API
 python tools/cp3_handcheck.py  # CP3 gate — PnL math vs. real tapes
 ```
+
+## Storage
+
+Measured, not estimated: bytes/row from a real Postgres 16 after ingesting live
+rows; volumes from full page-walks of the live API.
+
+| table | rows/day | bytes/row | per day |
+|---|---:|---:|---:|
+| `market_snapshots` | 78,354 open × 4 runs = 313,416 | 296 | **88.5 MB** |
+| `markets_terminal` | 66,005 settled | 2,263 | **142.4 MB** |
+| `market_taker_stats` | 17,078 (volume ≥ 1) | 240 | **3.9 MB** |
+| `series` / `events` | upsert-in-place | 1,767 / 1,151 | ~0 (21 MB fixed) |
+| | | | **≈ 235 MB/day** |
+
+That is **6.9 GB/month, 84 GB/year** — it fills Supabase Pro's included 8 GB in
+about 35 days. Two levers, both off by default:
+
+**1. Prune snapshots (recommended, no information loss).** `v_series_activity`
+only reads the last 24 hours. Everything older is history. Run daily:
+
+```bash
+psql "$DATABASE_URL" -v days=30 -f sql/020_prune.sql
+```
+
+Caps `market_snapshots` at ~2.6 GB steady state instead of growing forever
+(7 days ≈ 620 MB).
+
+**2. `TERMINAL_MIN_VOLUME=1` (a real tradeoff).** 74% of settled markets never
+trade — auto-generated crypto strike ladders. They carry no tape, contribute
+nothing to `v_taker_bleed`, and cost ~105 MB/day, most of it the `raw` jsonb
+(1,481 of the 2,263 bytes/row). Skipping them cuts `markets_terminal` from
+142 MB/day to 37 MB/day. It is a deliberate deviation from G4 — you lose the
+record that those markets existed — so it is opt-in.
+
+With both applied: **~41 MB/day ongoing growth** (1.2 GB/month), plus the capped
+snapshot window. That is ~135 days on Pro's included 8 GB.
+
+`select * from v_storage;` reports live per-table footprint and bytes/row;
+`select * from v_ingest_health;` reports freshness and whether a run is stale.
 
 ## The metric
 

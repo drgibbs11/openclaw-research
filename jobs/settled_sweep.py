@@ -24,6 +24,7 @@ log = logging.getLogger("settled_sweep")
 JOB = "settled_sweep"
 BATCH = 200
 LOOKBACK_DEFAULT_DAYS = 3  # first run with no cursor
+TERMINAL_MIN_VOLUME = float(os.environ.get("TERMINAL_MIN_VOLUME", "0"))
 OVERLAP = timedelta(hours=2)  # re-scan a little; upserts make it free (G3)
 
 
@@ -45,17 +46,25 @@ def sweep(conn, client: KalshiClient, since: datetime, page_cap: int) -> tuple[i
         if m.get("status") not in mappers.TERMINAL_STATUSES:  # D4
             continue
         st = ev_map.get(m.get("event_ticker"))
+        vol = float(m.get("volume_fp") or 0)
+
+        # Storage lever. Default 0 keeps every terminal market (G4). Set to 1
+        # to skip markets that never traded: they carry no tape, contribute
+        # nothing to v_taker_bleed, and at ~2.3 kB/row account for roughly
+        # 110 MB/day of the ~246 MB/day total. See README > Storage.
+        if vol < TERMINAL_MIN_VOLUME:
+            skipped_novol += 1
+            continue
+
         batch.append(mappers.terminal_row(m, st))
         ingested += 1
 
         # Ingest every terminal market, but only spend a tape request where
         # there is a tape to read. ~76% of settled markets have zero volume.
-        if float(m.get("volume_fp") or 0) >= tape.MIN_VOLUME:
+        if vol >= tape.MIN_VOLUME:
             markets.append({"ticker": m["ticker"], "result": m.get("result"),
                             "series_ticker": st,
                             "event_ticker": m.get("event_ticker")})
-        else:
-            skipped_novol += 1
 
         if len(batch) >= BATCH:
             db.upsert(conn, "markets_terminal", batch, conflict="ticker")
@@ -83,8 +92,9 @@ def sweep(conn, client: KalshiClient, since: datetime, page_cap: int) -> tuple[i
             if not m["series_ticker"]:
                 m["series_ticker"] = ev_map.get(m["event_ticker"])
 
-    log.info("terminal ingested: %d (%d zero-volume, tape queue %d, %d series links repaired)",
-             ingested, skipped_novol, len(markets), repaired)
+    log.info("terminal ingested: %d (%d skipped below TERMINAL_MIN_VOLUME=%s, "
+         "tape queue %d, %d series links repaired)",
+         ingested, skipped_novol, TERMINAL_MIN_VOLUME, len(markets), repaired)
 
     aggregated = 0
     for m in markets:
