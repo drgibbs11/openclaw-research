@@ -60,6 +60,7 @@ harmless on a direct connection.
 | `TAPE_MIN_VOLUME` | `1` | Skip zero-volume markets (empty tapes), Jobs B and C |
 | `BACKFILL_DAYS` | `180` | Backfill window |
 | `BACKFILL_MIN_VOLUME` | `TAPE_MIN_VOLUME` | Per-job override of the floor |
+| `BACKFILL_SOURCE` | `archive` | `archive` (deep, per-series) or `recent` (live only) |
 | `BACKFILL_EXCLUDE_CATEGORIES` | — | Comma-separated, e.g. `Sports` |
 | `BACKFILL_SKIP_INGEST` | — | Resume straight into phase 2 |
 | `CLASSIFY_MODEL` | `claude-sonnet-5` | Job D model |
@@ -72,6 +73,28 @@ python jobs/settled_sweep.py   # Job B — cron: 30 6 * * *
 python jobs/backfill.py        # Job C — manual, resumable
 python jobs/classify.py        # Job D — manual, resumable
 ```
+
+### Job C reads the archive, not the live endpoint
+
+`GET /markets` is a **rolling recent window**, not the full record — it reaches
+back roughly 75 days on the series measured, and returns *nothing at all* for
+slower ones. `min_settled_ts` beyond that window is silently ignored rather than
+refused. `/historical/markets` holds the real depth:
+
+| series | `/markets` | oldest | `/historical/markets` | oldest |
+|---|---:|---|---:|---|
+| KXHIGHNY | 444 | 2026-05-25 | 8,956 | 2021-08-08 |
+| KXCPIYOY | 48 | 2026-06-10 | 555 | 2022-12-13 |
+| KXJOBLESS | **0** | — | **71** | 2021-08-14 |
+
+This is retention, not authentication — see D26. Everything is public; no API
+key is needed. But it means Job C walks the archive per recurring series by
+default. Set `BACKFILL_SOURCE=recent` to use only the cheap live walk, at the
+cost of depth.
+
+The tape splits the same way: an archived market returns zero trades from
+`/markets/trades` and its real tape from `/historical/trades`. `lib/tape.py`
+falls back automatically.
 
 ### Size Job C before you start it
 

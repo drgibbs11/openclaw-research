@@ -214,6 +214,24 @@ class KalshiClient:
             params["mve_filter"] = "exclude"
         return self.iter_items("/markets", "markets", params, max_pages)
 
+    def iter_historical_markets(self, series_ticker: str,
+                                max_pages: int | None = None, **params) -> Iterator[dict]:
+        """Deep archive for one series (D26).
+
+        `/markets` only exposes a rolling recent window; this endpoint reaches
+        back years. It has no time or status filter — `min_settled_ts` and
+        friends are accepted and silently ignored — but results come back
+        newest-first, so a caller wanting a bounded window can stop early
+        rather than draining the whole series.
+        The spec documents `mve_filter` on this endpoint, but sending it —
+        with its only documented value, `exclude` — returns a 400 (D27). Combo
+        markets are filtered client-side instead.
+        """
+        params = {"limit": MAX_LIMIT, "series_ticker": series_ticker, **params}
+        for m in self.iter_items("/historical/markets", "markets", params, max_pages):
+            if not m.get("mve_collection_ticker"):
+                yield m
+
     def iter_trades(self, ticker: str, historical: bool = False,
                     max_pages: int | None = None, **params) -> Iterator[tuple[dict, int]]:
         """Public tape. D11: block trades excluded — they are negotiated

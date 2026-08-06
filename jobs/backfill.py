@@ -49,8 +49,86 @@ def event_series_map(conn) -> dict[str, str]:
         return dict(cur.fetchall())
 
 
+def recurring_series(conn) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute("""
+            select series_ticker from series
+             where coalesce(frequency, '') not in ('one_off', '')
+             order by series_ticker
+        """)
+        return [r[0] for r in cur.fetchall()]
+
+
+def ingest_archive(conn, client: KalshiClient, since: datetime) -> int:
+    """Phase 1 — walk the deep archive per series (D26).
+
+    `/markets` only exposes a rolling recent window (~75 days on the series
+    measured, and *nothing at all* for slower series like KXJOBLESS), so
+    ingesting a 180-day backfill from it silently under-collects. The archive
+    endpoint has no time filter, but returns newest-first — so we stop as soon
+    as a page is entirely older than the window.
+
+    Restricted to recurring series: v_screen requires recurrence='recurring',
+    so one-off series can never surface and are not worth the walk.
+    """
+    ev_map = event_series_map(conn)
+    tickers = recurring_series(conn)
+    log.info("archive walk over %d recurring series", len(tickers))
+
+    total, batch = 0, []
+    for i, st in enumerate(tickers, 1):
+        kept_any = False
+        for page, markets in enumerate(
+                _pages(client.iter_historical_markets(st))):
+            in_window = 0
+            for m in markets:
+                if m.get("status") not in mappers.TERMINAL_STATUSES:  # D4
+                    continue
+                s_ts = mappers.ts(m.get("settlement_ts")) or mappers.ts(m.get("close_time"))
+                if s_ts and s_ts < since:
+                    continue
+                in_window += 1
+                batch.append(mappers.terminal_row(m, ev_map.get(m.get("event_ticker")) or st))
+            kept_any |= in_window > 0
+            if in_window == 0 and page > 0:
+                break  # newest-first: an all-stale page means we're past the window
+            if len(batch) >= BATCH:
+                total += db.upsert(conn, "markets_terminal", batch, conflict="ticker")
+                conn.commit()
+                batch = []
+        if i % 100 == 0:
+            log.info("archive: %d/%d series, %d markets, %d requests",
+                     i, len(tickers), total, client.request_count)
+
+    if batch:
+        total += db.upsert(conn, "markets_terminal", batch, conflict="ticker")
+        conn.commit()
+
+    repaired = tape.repair_series_links(conn)
+    conn.commit()
+    log.info("archive ingest complete: %d markets, %d series links repaired", total, repaired)
+    return total
+
+
+def _pages(items):
+    """Regroup a flat item iterator into API-page-sized chunks."""
+    buf = []
+    for it in items:
+        buf.append(it)
+        if len(buf) >= 1000:
+            yield buf
+            buf = []
+    if buf:
+        yield buf
+
+
 def ingest(conn, client: KalshiClient, since: datetime) -> int:
-    """Phase 1 — page settled markets over the window into markets_terminal."""
+    """Phase 1 (recent window only) — page settled markets from /markets.
+
+    Cheaper than the archive walk because it is a single global page-walk, but
+    it only reaches back as far as the live endpoint's retention (D26). Use
+    ingest_archive() for real depth.
+    """
     ev_map = event_series_map(conn)
     min_settled_ts = int(since.timestamp())  # D6
     total, batch = 0, []
@@ -131,6 +209,12 @@ def main() -> int:
 
     with db.connect() as conn:
         if os.environ.get("BACKFILL_SKIP_INGEST", "").lower() not in ("1", "true", "yes"):
+            # Archive-first: /markets alone silently caps at the live retention
+            # window and returns nothing for slower series (D26). The recent
+            # walk still runs — it is one cheap global page-walk and covers
+            # anything listed since the archive was last written.
+            if os.environ.get("BACKFILL_SOURCE", "archive").lower() != "recent":
+                ingest_archive(conn, client, since)
             ingest(conn, client, since)
 
         markets = pending_markets(conn, since, exclude)

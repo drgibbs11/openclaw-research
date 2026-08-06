@@ -288,13 +288,95 @@ legacy tickers predate the `KX` prefix (`JOBLESS` → `KXJOBLESS`, `AITURING` �
 the key the entire screen groups by is not acceptable, so linkage always goes
 through the API.
 
+## D26 — CRITICAL: `/markets` is a rolling recent window, not the full record.
+
+Investigated after a question about whether public endpoints expose only a
+subset of markets. **They do — but the cause is retention, not authentication.**
+
+`GET /markets` only reaches back a limited window, and asking for more is
+silently ignored rather than refused:
+
+| `min_settled_ts` window | KXHIGHNY markets returned | oldest settlement |
+|---|---:|---|
+| 30 days | 180 | 2026-07-08 |
+| 90 days | 444 | 2026-05-25 |
+| 180 days | 444 | 2026-05-25 |
+| 365 days | 444 | 2026-05-25 |
+| 1000 days | 444 | 2026-05-25 |
+
+`/historical/markets` for the same series returns markets back to **2021-08-08**.
+Per series, live vs. archive:
+
+| series | `/markets` | oldest | `/historical/markets` | oldest |
+|---|---:|---|---:|---|
+| KXHIGHNY | 444 | 2026-05-25 | 8,956 | 2021-08-08 |
+| KXCPIYOY | 48 | 2026-06-10 | 555 | 2022-12-13 |
+| KXFED | 22 | 2026-06-17 | 379 | 2021-09-24 |
+| **KXJOBLESS** | **0** | — | **71** | 2021-08-14 |
+
+The tape splits the same way: for an archived market, `/markets/trades` returns
+**zero trades with no error**, while `/historical/trades` returns the real tape
+(47, 44, and 1 trades on three sampled KXJOBLESS markets, which price correctly
+through the §7 math).
+
+**Why this was nearly fatal to v1.** Job C's 180-day backfill read `/markets`,
+so it would have silently collected ~75 days and *nothing at all* for slower
+series. KXJOBLESS and KXCPIYOY — weekly and monthly economic series settling to
+published government statistics, with no sportsbook equivalent — are precisely
+the profile `v_screen` exists to surface, and every one of them was invisible.
+After the fix, KXCPIYOY produces 39 settled markets and −2.24 c/ct gross
+(−3.21 fee-adjusted), clearing the `n_settled >= 20` threshold.
+
+**Fix:** Job C now walks `/historical/markets` per recurring series
+(`iter_historical_markets`). That endpoint has no time or status filter —
+`min_settled_ts` is accepted and silently ignored — but returns newest-first,
+so the walk stops once a page falls entirely outside the window. The cheap
+global `/markets` walk still runs afterwards for anything listed since the
+archive was last written. `lib/tape.py` already fell back to
+`/historical/trades` on an empty tape, so the trade side needed no change.
+
+### This is not an authentication boundary
+
+Worth stating explicitly, since the natural reading is "we need an API key":
+
+- The vendored spec declares `security` **only** on `/portfolio/*` order
+  endpoints. Market-data paths inherit no global security requirement.
+- Every market-data GET returns 200 unauthenticated. No 401 anywhere (G2).
+- Within the live window the data is *complete*, not sampled. Per-status counts
+  fetched independently sum exactly to the unfiltered walk (12 open + 444
+  settled = 456). Three independent access paths — `/markets?series_ticker`,
+  `/markets?event_ticker`, and `/events/{ticker}?with_nested_markets=true` —
+  agree exactly on the same 6 markets for a sampled event.
+- The apparently-truncated weather ladder is the real product shape, not a cap:
+  the six strikes are `≤88°, 89–90, 91–92, 93–94, 95–96, ≥97`. The open-ended
+  buckets at both ends partition every possible temperature, so no seventh
+  market can exist without overlapping one of them. All 380 daily-high events
+  sampled across five cities show exactly six.
+- The "missing" history is fully retrievable **unauthenticated** from
+  `/historical/*`.
+
+Limitation, stated plainly: without a key we cannot prove an authenticated
+`/markets` call returns no more than an unauthenticated one. But the missing
+data is entirely recoverable without auth, so a key is not needed for v1, and
+G2 forbids implementing signing regardless.
+
+## D27 — `mve_filter` is rejected by `/historical/markets`.
+
+The spec lists `mve_filter` on `/historical/markets` with enum `['exclude']`.
+Sending that documented value returns `400 bad_request`, for every series
+tested and at any limit. Combo markets are filtered client-side on that endpoint
+instead (`mve_collection_ticker` is set on them). `/markets` accepts
+`mve_filter` normally.
+
 ---
 
 ## Unresolved / carried forward
 
-- **U1 — `/historical/*` cutover boundary.** Undocumented. Job C's fallback is
-  empirical. If the 180-day backfill shows a cliff of empty tapes at a fixed
-  age, that age is the boundary; record it here.
+- **U1 — RESOLVED by D26.** The `/historical/*` split is a retention boundary
+  on the live endpoints, not a documented cutover. Measured at ~75 days on
+  KXHIGHNY, but it is not a fixed global age — KXJOBLESS returns nothing live
+  at any age, while high-volume series stay live longer. Treat the archive as
+  the authority for anything older than a few weeks.
 - **U2 — `fee_type: quadratic_with_maker_fees`** (130 series) charges makers too.
   Our metric reports *taker* bleed, so maker fees don't enter the taker PnL — but
   "maker PnL ≈ −taker PnL" (§7) overstates maker economics on these 130 series.
