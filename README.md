@@ -73,7 +73,7 @@ harmless on a direct connection.
 | `BACKFILL_SOURCE` | `archive` | `archive` (deep, per-series) or `recent` (live only) |
 | `BACKFILL_EXCLUDE_CATEGORIES` | — | Comma-separated, e.g. `Sports` |
 | `BACKFILL_SKIP_INGEST` | — | Resume straight into phase 2 |
-| `TERMINAL_MIN_VOLUME` | `0` | Set to `1` to skip never-traded settled markets (see Storage) |
+| `TERMINAL_MIN_VOLUME` | `1` | Skip never-traded settled markets; `0` keeps everything (see Storage) |
 | `SCREENER_SCHEMA` | `screener` | Postgres schema; never `public` |
 | `CLASSIFY_MODEL` | `claude-sonnet-5` | Job D model |
 
@@ -133,6 +133,27 @@ python tools/smoke_test.py     # client + mappers vs. the live API
 python tools/cp3_handcheck.py  # CP3 gate — PnL math vs. real tapes
 ```
 
+## Deployment status
+
+The `screener` schema is **live on Supabase** (project `iusnbmsmbgkevjjlpmck`):
+7 tables, 9 views, applied as migrations `screener_schema_init` and
+`screener_views_init`. `public` was not touched — 80 tables before and after,
+and `public.market_snapshots` still holds its 89,574 rows.
+
+Seeded with a small real sample (8 series, 66 open-market snapshots) purely to
+prove the views compute on live data. **Those activity numbers are not the true
+series totals** — the seed caps at 12 markets per series, so anything with a
+wider ladder is undercounted. Real numbers arrive with the first Job A run.
+
+Still to do, and all it needs is credentials on Railway:
+
+| | needs |
+|---|---|
+| Job A / B on cron | `DATABASE_URL` (the Postgres connection string, not the MCP link) |
+| Job C backfill | same, then run manually |
+| Job D classify | `ANTHROPIC_API_KEY` |
+| Daily prune | `sql/020_prune.sql` as a cron step |
+
 ## Storage
 
 Measured, not estimated: bytes/row from a real Postgres 16 after ingesting live
@@ -159,12 +180,13 @@ psql "$DATABASE_URL" -v days=30 -f sql/020_prune.sql
 Caps `market_snapshots` at ~2.6 GB steady state instead of growing forever
 (7 days ≈ 620 MB).
 
-**2. `TERMINAL_MIN_VOLUME=1` (a real tradeoff).** 74% of settled markets never
+**2. `TERMINAL_MIN_VOLUME` (default `1`, a real tradeoff).** 74% of settled markets never
 trade — auto-generated crypto strike ladders. They carry no tape, contribute
 nothing to `v_taker_bleed`, and cost ~105 MB/day, most of it the `raw` jsonb
 (1,481 of the 2,263 bytes/row). Skipping them cuts `markets_terminal` from
 142 MB/day to 37 MB/day. It is a deliberate deviation from G4 — you lose the
-record that those markets existed — so it is opt-in.
+record that those markets existed — and is on by default because the target
+database already holds 17 GB. Set `TERMINAL_MIN_VOLUME=0` to keep everything.
 
 With both applied: **~41 MB/day ongoing growth** (1.2 GB/month), plus the capped
 snapshot window. That is ~135 days on Pro's included 8 GB.

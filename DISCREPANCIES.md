@@ -43,10 +43,16 @@ All count columns are `numeric` in the DDL.
 
 ## D3 — BREAKING: prices are not always whole cents.
 
-Markets carry `price_level_structure` (`"cent"` | `"deci_cent"`) and a
-`price_ranges` array giving `start`/`end`/`step`. Observed `step: "0.0010"` —
-tenths of a cent. So "integer cents 1–99" (§11) is false for deci-cent markets.
-Both fields are persisted so the tick regime is recoverable per market.
+Markets carry `price_level_structure` and a `price_ranges` array giving
+`start`/`end`/`step`. Observed `step: "0.0010"` — tenths of a cent. So "integer
+cents 1-99" (§11) is false for deci-cent markets. Both fields are persisted so
+the tick regime is recoverable per market.
+
+Measured values over ~5,000 open markets: `linear_cent` (2,992),
+`deci_cent` (2,000), `tapered_deci_cent` (8). Note `linear_cent`, not `cent` —
+an earlier draft of this entry guessed the plain form from the deci-cent
+example and was wrong. Do not branch on an assumed two-value enum; the column
+is stored verbatim and should be read, not predicted.
 
 ## D4 — status: the filter enum and the response enum are different vocabularies.
 

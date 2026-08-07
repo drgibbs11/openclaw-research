@@ -24,7 +24,7 @@ log = logging.getLogger("settled_sweep")
 JOB = "settled_sweep"
 BATCH = 200
 LOOKBACK_DEFAULT_DAYS = 3  # first run with no cursor
-TERMINAL_MIN_VOLUME = float(os.environ.get("TERMINAL_MIN_VOLUME", "0"))
+TERMINAL_MIN_VOLUME = float(os.environ.get("TERMINAL_MIN_VOLUME", "1"))
 OVERLAP = timedelta(hours=2)  # re-scan a little; upserts make it free (G3)
 
 
@@ -48,10 +48,11 @@ def sweep(conn, client: KalshiClient, since: datetime, page_cap: int) -> tuple[i
         st = ev_map.get(m.get("event_ticker"))
         vol = float(m.get("volume_fp") or 0)
 
-        # Storage lever. Default 0 keeps every terminal market (G4). Set to 1
-        # to skip markets that never traded: they carry no tape, contribute
-        # nothing to v_taker_bleed, and at ~2.3 kB/row account for roughly
-        # 110 MB/day of the ~246 MB/day total. See README > Storage.
+        # Storage lever, default ON. Skips markets that never traded: they
+        # carry no tape, contribute nothing to v_taker_bleed, and at ~2.3 kB/row
+        # account for ~105 MB/day of the ~235 MB/day total. Enabled by default
+        # because the target database already holds 17 GB. Set to 0 to keep
+        # every terminal market per G4. See README > Storage.
         if vol < TERMINAL_MIN_VOLUME:
             skipped_novol += 1
             continue
