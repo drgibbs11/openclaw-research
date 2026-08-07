@@ -12,6 +12,8 @@
 -- which is cheaper than deleting afterwards).
 --
 -- Tune with :days, e.g.  psql "$DATABASE_URL" -v days=7 -f sql/020_prune.sql
+set search_path to screener;
+
 \if :{?days}
 \else
   \set days 30

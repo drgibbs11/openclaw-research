@@ -28,9 +28,34 @@ def dsn() -> str:
     return url
 
 
+# All screener objects live here, never in `public` — the target database is a
+# live weather-trading system whose `public` schema already contains an
+# unrelated `market_snapshots`. Setting search_path on the connection keeps
+# every query in this codebase unqualified while still resolving to our own
+# tables. Override only if you deliberately relocated the schema.
+SCHEMA = os.environ.get("SCREENER_SCHEMA", "screener")
+
+
 @contextmanager
 def connect(autocommit: bool = False):
     conn = psycopg.connect(dsn(), prepare_threshold=None, autocommit=autocommit)
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"set search_path to {SCHEMA}")
+            # Fail loudly rather than silently falling through to public, where
+            # an insert would either error on missing columns or, worse, land
+            # in somebody else's table.
+            cur.execute("select to_regclass(%s)", (f"{SCHEMA}.series",))
+            if cur.fetchone()[0] is None:
+                raise RuntimeError(
+                    f"schema '{SCHEMA}' is missing or not initialised — "
+                    "run sql/001_schema.sql first"
+                )
+        if autocommit is False:
+            conn.commit()
+    except Exception:
+        conn.close()
+        raise
     try:
         yield conn
         if not autocommit:

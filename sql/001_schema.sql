@@ -1,4 +1,15 @@
 -- Kalshi long-tail screener — schema
+--
+-- Everything lives in its own `screener` schema, never `public`.
+-- The target database is a live weather-trading system with 80 public tables,
+-- one of which is already called `market_snapshots` with an unrelated shape
+-- (movement_id / station_code / minutes_after). Under `create table if not
+-- exists` that collision is silent: the create is skipped, and the first insert
+-- fails on columns that don't exist. A separate schema removes the whole class
+-- of problem and keeps ownership and retention obvious.
+
+create schema if not exists screener;
+set search_path to screener;
 -- Deviations from build-spec §5 are all traceable to DISCREPANCIES.md (D1-D20).
 -- G5: every timestamp is timestamptz, stored UTC.
 -- G4: entity tables keep the full source object in `raw`. (Exception: D20.)

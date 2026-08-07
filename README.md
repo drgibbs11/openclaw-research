@@ -46,6 +46,15 @@ psql "$DATABASE_URL" -f sql/001_schema.sql
 psql "$DATABASE_URL" -f sql/010_views.sql
 ```
 
+Everything is created in a dedicated **`screener` schema**, never `public`.
+The target Supabase project is a live weather-trading system with 80 public
+tables — one of which is already called `market_snapshots`, with an unrelated
+shape. Under `create table if not exists` that collision is silent: the create
+is skipped and the first insert fails on columns that don't exist. `lib/db.py`
+sets `search_path` on every connection and refuses to run if the schema is
+missing, so application code stays unqualified but can never touch `public`.
+Override with `SCREENER_SCHEMA` if you relocate it.
+
 **Supabase pooler gotcha:** if `DATABASE_URL` is the transaction pooler
 (port 6543), psycopg3 prepared statements break. `lib/db.py` passes
 `prepare_threshold=None` unconditionally, which is correct on the pooler and
@@ -65,6 +74,7 @@ harmless on a direct connection.
 | `BACKFILL_EXCLUDE_CATEGORIES` | — | Comma-separated, e.g. `Sports` |
 | `BACKFILL_SKIP_INGEST` | — | Resume straight into phase 2 |
 | `TERMINAL_MIN_VOLUME` | `0` | Set to `1` to skip never-traded settled markets (see Storage) |
+| `SCREENER_SCHEMA` | `screener` | Postgres schema; never `public` |
 | `CLASSIFY_MODEL` | `claude-sonnet-5` | Job D model |
 
 ## Running

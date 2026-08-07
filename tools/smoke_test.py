@@ -57,7 +57,10 @@ def main() -> int:
               snap["close_time"] is None or snap["close_time"].tzinfo is not None)
 
     print("settled markets")
-    settled = [x for _, x in zip(range(40), client.iter_markets(status="settled"))]
+    # 400, not 40: ~76% of settled markets never trade (D23) and they arrive in
+    # runs, so a 40-market sample is regularly all-zero-volume and the tape
+    # check below finds nothing to score. That is a flaky test, not a finding.
+    settled = [x for _, x in zip(range(400), client.iter_markets(status="settled"))]
     check("settled markets reachable", len(settled) > 0, f"{len(settled)} fetched")
     terminal = [x for x in settled if x.get("status") in mappers.TERMINAL_STATUSES]
     check("payload status is terminal (D4)", len(terminal) == len(settled),

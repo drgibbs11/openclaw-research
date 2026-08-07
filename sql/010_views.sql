@@ -1,4 +1,5 @@
 -- Kalshi long-tail screener — screen views (build-spec §9)
+set search_path to screener;
 -- Band and thresholds are starting values, not conclusions — tune after CP5.
 
 -- Dropped and recreated rather than CREATE OR REPLACE'd: replace cannot change
@@ -175,5 +176,5 @@ select c.relname as table_name,
        end                                                            as bytes_per_row
 from pg_class c
 join pg_namespace n on n.oid = c.relnamespace
-where n.nspname = 'public' and c.relkind = 'r'
+where n.nspname = 'screener' and c.relkind = 'r'
 order by pg_total_relation_size(c.oid) desc;
