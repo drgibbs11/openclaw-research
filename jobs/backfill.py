@@ -50,13 +50,61 @@ def event_series_map(conn) -> dict[str, str]:
 
 
 def recurring_series(conn) -> list[str]:
+    """Series to walk, narrowest defensible scope first.
+
+    The unqualified `frequency <> 'one_off'` filter is a trap. It admits
+    `custom` — 5,387 of 12,564 live series — so the walk covers 7,617 series
+    rather than the 643 that actually recur and trade. It also admits the
+    high-frequency crypto ladders: KXSOLE alone carries 350 open strikes, which
+    at hourly x 180 days is on the order of a million markets for one series.
+    Unscoped, this phase is effectively unbounded (D32).
+
+    Three levels, most specific wins:
+      BACKFILL_SERIES=KXHIGHNY,KXCPICORE   explicit list
+      BACKFILL_FROM_SCREEN=1               whatever survives the cheap filters
+      (default)                            recurring frequencies only, no `custom`
+    """
+    explicit = os.environ.get("BACKFILL_SERIES", "").strip()
+    if explicit:
+        tickers = [t.strip() for t in explicit.split(",") if t.strip()]
+        log.info("scope: explicit BACKFILL_SERIES (%d series)", len(tickers))
+        return sorted(set(tickers))
+
+    if os.environ.get("BACKFILL_FROM_SCREEN", "").lower() in ("1", "true", "yes"):
+        # Everything v_screen needs except the bleed half — which is exactly
+        # what this job is about to produce.
+        with conn.cursor() as cur:
+            cur.execute("""
+                select s.series_ticker
+                  from series s
+                  join series_tags t using (series_ticker)
+                  left join v_series_activity a using (series_ticker)
+                 where t.recurrence = 'recurring'
+                   and t.benchmark = 'none'
+                   and t.settlement_source_type
+                       in ('scrapable_numeric_feed', 'official_report')
+                   and coalesce(s.fee_type, '') <> 'quadratic_with_maker_fees'
+                   and coalesce(a.sum_vol24h_latest, 0) between 1000 and 100000
+                   and coalesce(a.breadth, 0) >= 0.34
+                 order by s.series_ticker
+            """)
+            tickers = [r[0] for r in cur.fetchall()]
+        log.info("scope: v_screen candidates (%d series)", len(tickers))
+        return tickers
+
     with conn.cursor() as cur:
+        # `custom` is excluded deliberately: D9 leaves it genuinely ambiguous,
+        # so it cannot reach recurrence='recurring' and cannot reach v_screen.
         cur.execute("""
             select series_ticker from series
-             where coalesce(frequency, '') not in ('one_off', '')
+             where coalesce(frequency, '') in
+                   ('fifteen_min', 'hourly', 'daily', 'weekly',
+                    'monthly', 'quarterly', 'annual')
              order by series_ticker
         """)
-        return [r[0] for r in cur.fetchall()]
+        tickers = [r[0] for r in cur.fetchall()]
+    log.info("scope: recurring frequencies (%d series)", len(tickers))
+    return tickers
 
 
 def ingest_archive(conn, client: KalshiClient, since: datetime) -> int:

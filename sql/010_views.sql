@@ -47,15 +47,31 @@ order by ticker, run_ts desc;
 create view v_series_activity as
 select s.series_ticker,
        count(distinct ls.ticker)                            as open_markets,
+       count(distinct ls.ticker) filter (where ls.volume_24h > 0)
+                                                            as live_markets,
+       -- Breadth: what fraction of the strike ladder actually trades. Summed
+       -- volume alone cannot tell a healthy distributed series from a dead
+       -- ladder with one hot strike, and the difference decides whether a
+       -- passive seat is fillable at all. Measured: KXUE looked tradeable on
+       -- volume (1,444/day) but only 7 of 68 markets had any, with 94% of it
+       -- in a single contract; KXHIGHTDC had 12 of 12 live. See D31.
+       round(count(distinct ls.ticker) filter (where ls.volume_24h > 0)::numeric
+             / nullif(count(distinct ls.ticker), 0), 3)     as breadth,
        -- percentile_cont returns double precision; cast back so the whole
        -- pipeline stays in numeric and money never round-trips through a float.
        percentile_cont(0.5) within group (order by ls.volume_24h)::numeric
                                                             as med_mkt_vol24h,
        sum(ls.volume_24h)                                   as sum_vol24h_latest,
-       percentile_cont(0.5) within group (order by (ls.yes_ask - ls.yes_bid))::numeric
-                                                            as med_spread_dollars,
-       (percentile_cont(0.5) within group (order by (ls.yes_ask - ls.yes_bid)) * 100)::numeric
-                                                            as med_spread_cents,
+       max(ls.volume_24h) / nullif(sum(ls.volume_24h), 0)   as top_market_share,
+       -- Spread over markets that TRADE. Including untraded strikes drags the
+       -- median toward the width of dead contracts, which inverts the ranking:
+       -- the widest "spreads" in the first live run were all dead ladders.
+       percentile_cont(0.5) within group (
+         order by (ls.yes_ask - ls.yes_bid)) filter (where ls.volume_24h > 0)
+                                                       ::numeric as med_spread_dollars,
+       (percentile_cont(0.5) within group (
+         order by (ls.yes_ask - ls.yes_bid)) filter (where ls.volume_24h > 0)
+        * 100)::numeric                                      as med_spread_cents,
        max(ls.run_ts)                                       as as_of
 from series s
 join v_latest_snapshot ls on ls.series_ticker = s.series_ticker
@@ -95,7 +111,8 @@ group by 1;
 create view v_screen as
 select s.series_ticker, s.title, s.category, s.frequency,
        t.settlement_source_type, t.benchmark, t.recurrence, t.scrape_difficulty,
-       a.open_markets, a.sum_vol24h_latest, a.med_spread_cents,
+       a.open_markets, a.live_markets, a.breadth, a.top_market_share,
+       a.sum_vol24h_latest, a.med_spread_cents,
        b.n_settled, b.contracts,
        b.gross_bleed_cents_per_ct, b.feeadj_bleed_cents_per_ct,
        s.fee_type, s.fee_multiplier
@@ -106,7 +123,12 @@ left join v_taker_bleed b using (series_ticker)
 where t.recurrence = 'recurring'
   and t.benchmark = 'none'
   and t.settlement_source_type in ('scrapable_numeric_feed', 'official_report')
+  -- Paying maker fees inverts the entire premise of a passive seat. Published
+  -- per series, so this costs nothing to check (D29).
+  and coalesce(s.fee_type, '') <> 'quadratic_with_maker_fees'
   and coalesce(a.sum_vol24h_latest, 0) between 1000 and 100000   -- contracts/day band, tune
+  -- At least a third of the ladder must actually trade (D31).
+  and coalesce(a.breadth, 0) >= 0.34
   and coalesce(b.n_settled, 0) >= 20
 order by b.feeadj_bleed_cents_per_ct asc nulls last;  -- most-negative = takers bleed most
 
@@ -124,14 +146,29 @@ select
       and benchmark = 'none'
       and settlement_source_type in ('scrapable_numeric_feed', 'official_report'))
                                                                          as scrapable,
+  (select count(*) from series_tags t join series s using (series_ticker)
+    where t.recurrence = 'recurring' and t.benchmark = 'none'
+      and t.settlement_source_type in ('scrapable_numeric_feed', 'official_report')
+      and coalesce(s.fee_type, '') <> 'quadratic_with_maker_fees')       as no_maker_fees,
   (select count(*) from v_series_activity
      where sum_vol24h_latest between 1000 and 100000)                    as in_volume_band,
+  (select count(*) from v_series_activity
+     where sum_vol24h_latest between 1000 and 100000
+       and breadth >= 0.34)                                              as ladder_alive,
   (select count(*) from v_taker_bleed where n_settled >= 20)             as enough_settled,
   (select count(*) from v_screen)                                        as passes_all;
 
 -- CP5 ground truth: the daily temperature series must classify as
 -- scrapable_numeric_feed + benchmark=none + recurring. If they don't, the
 -- classifier is broken — fix it before trusting anything else in the screen.
+--
+-- The ticker prefix alone is NOT sufficient. `like 'KXLOW%'` also matches
+-- Lowe's (KXLOW, KXLOWA "Lowe's Annual KPI", KXLOWCC "Lowe's Credit Card
+-- Spend") and `like 'KXHIGH%'` matches KXHIGHMOVDJT ("Highest margin of
+-- victory"). Those are one_off Financials/Politics series that correctly fail
+-- the check, so the unqualified pattern reported 50/61 and made a working
+-- classifier look broken. Constraining to the weather category gives 52/53 —
+-- the residual is KXHIGHTEMPDEN, whose frequency is `custom` (D30).
 create view v_cp5_ground_truth as
 select s.series_ticker, s.title, s.frequency,
        t.settlement_source_type, t.benchmark, t.recurrence,
@@ -140,7 +177,8 @@ select s.series_ticker, s.title, s.frequency,
         and t.recurrence = 'recurring')                as passes
 from series s
 left join series_tags t using (series_ticker)
-where s.series_ticker like 'KXHIGH%' or s.series_ticker like 'KXLOW%';
+where (s.series_ticker like 'KXHIGH%' or s.series_ticker like 'KXLOW%')
+  and s.category = 'Climate and Weather';
 
 -- ---------------------------------------------------------------- health
 -- Freshness and volume, so a stale or half-run pipeline is visible rather than

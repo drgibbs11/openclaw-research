@@ -27,6 +27,7 @@ lib/kalshi.py           paginated GET client — throttle, backoff, cursor pagin
 lib/bleed.py            the taker-bleed metric
 lib/tape.py             shared tape aggregation for Jobs B and C
 lib/mappers.py          API object -> DB row
+lib/classify_rules.py   deterministic series classification (replaces the LLM)
 lib/db.py               psycopg3 helpers, idempotent upserts
 jobs/snapshot.py        Job A — every 6h
 jobs/settled_sweep.py   Job B — daily
@@ -40,11 +41,14 @@ tools/smoke_test.py     offline check of client + mappers against the live API
 
 ```bash
 pip install -r requirements.txt
-export DATABASE_URL=...        # Supabase
-export ANTHROPIC_API_KEY=...   # Job D only
+export DATABASE_URL=...        # Supabase — the only credential needed
 psql "$DATABASE_URL" -f sql/001_schema.sql
 psql "$DATABASE_URL" -f sql/010_views.sql
 ```
+
+`DATABASE_URL` is the whole credential surface. Job D used to call an LLM to
+fill in `series_tags`; it is now a deterministic rules pass
+(`lib/classify_rules.py`), so **no API key is required anywhere** — see D28.
 
 Everything is created in a dedicated **`screener` schema**, never `public`.
 The target Supabase project is a live weather-trading system with 80 public
@@ -63,7 +67,6 @@ harmless on a direct connection.
 | Env var | Default | Purpose |
 |---|---|---|
 | `DATABASE_URL` | — | Supabase Postgres |
-| `ANTHROPIC_API_KEY` | — | Job D only |
 | `KALSHI_BASE_URL` | `https://api.elections.kalshi.com/trade-api/v2` | API base |
 | `THROTTLE_RPS` | `5` | Client-side request rate |
 | `TAPE_PAGE_CAP` | `50` | Pages per market on the tape |
@@ -74,8 +77,9 @@ harmless on a direct connection.
 | `BACKFILL_EXCLUDE_CATEGORIES` | — | Comma-separated, e.g. `Sports` |
 | `BACKFILL_SKIP_INGEST` | — | Resume straight into phase 2 |
 | `TERMINAL_MIN_VOLUME` | `1` | Skip never-traded settled markets; `0` keeps everything (see Storage) |
+| `BACKFILL_SERIES` | — | Comma-separated explicit scope for Job C |
+| `BACKFILL_FROM_SCREEN` | — | Scope Job C to surviving screen candidates |
 | `SCREENER_SCHEMA` | `screener` | Postgres schema; never `public` |
-| `CLASSIFY_MODEL` | `claude-sonnet-5` | Job D model |
 
 ## Running
 
@@ -83,7 +87,7 @@ harmless on a direct connection.
 python jobs/snapshot.py        # Job A — cron: 0 */6 * * *
 python jobs/settled_sweep.py   # Job B — cron: 30 6 * * *
 python jobs/backfill.py        # Job C — manual, resumable
-python jobs/classify.py        # Job D — manual, resumable
+python jobs/classify.py        # Job D — rules pass, no API key, idempotent
 ```
 
 ### Job C reads the archive, not the live endpoint
@@ -107,6 +111,24 @@ cost of depth.
 The tape splits the same way: an archived market returns zero trades from
 `/markets/trades` and its real tape from `/historical/trades`. `lib/tape.py`
 falls back automatically.
+
+### Scope Job C, or it will not finish
+
+Job C's default scope used to be `frequency <> 'one_off'`, which admits the
+5,387 `custom` series and every high-frequency crypto ladder — `KXSOLE` alone
+carries 350 open strikes, so at hourly × 180 days that is ~1M markets for one
+series. Unscoped it is effectively unbounded (D32). Three tiers, most specific
+first:
+
+```bash
+BACKFILL_SERIES=KXHIGHNY,KXCPICORE python jobs/backfill.py   # explicit
+BACKFILL_FROM_SCREEN=1 python jobs/backfill.py               # screen survivors
+python jobs/backfill.py                                      # recurring only
+```
+
+Scoped to the ~85 survivors that is ~91k markets and ~64k tape requests —
+**4–7 hours** rather than weeks. Run Job D *before* Job C so the candidate set
+exists to scope against.
 
 ### Size Job C before you start it
 
@@ -145,14 +167,17 @@ prove the views compute on live data. **Those activity numbers are not the true
 series totals** — the seed caps at 12 markets per series, so anything with a
 wider ladder is undercounted. Real numbers arrive with the first Job A run.
 
-Still to do, and all it needs is credentials on Railway:
+Still to do. `DATABASE_URL` is the only credential involved:
 
 | | needs |
 |---|---|
 | Job A / B on cron | `DATABASE_URL` (the Postgres connection string, not the MCP link) |
-| Job C backfill | same, then run manually |
-| Job D classify | `ANTHROPIC_API_KEY` |
+| Job D classify | same — deterministic rules, no API key (D28) |
+| Job C backfill | same, then run manually and **scoped** (D32) |
 | Daily prune | `sql/020_prune.sql` as a cron step |
+
+Run order matters: **A → D → C**. Job D is what produces the candidate set that
+Job C scopes against, and Job C unscoped does not finish.
 
 ## Storage
 
@@ -219,7 +244,7 @@ reconciles tape contracts against each market's reported volume.
 | CP1 | Spec + fixtures vendored, diffed, DDL written | done — see `DISCREPANCIES.md` |
 | CP2 | Job A on cron, two runs, spot-check 3 tickers | needs `DATABASE_URL` |
 | CP3 | Tape math matches hand-computed PnL to the cent | **passing** — `tools/cp3_handcheck.py` |
-| CP4 | Job D complete, ≥25-row human review under 10% error | needs credentials |
+| CP4 | Job D complete, ≥25-row human review under 10% error | needs `DATABASE_URL` |
 | CP5 | `v_screen` returns rows; temperature series classify correctly | needs CP2–CP4 |
 
 `v_screen_funnel` shows how many series survive each filter, so an empty screen

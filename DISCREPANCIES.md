@@ -374,6 +374,87 @@ tested and at any limit. Combo markets are filtered client-side on that endpoint
 instead (`mve_collection_ticker` is set on them). `/markets` accepts
 `mve_filter` normally.
 
+## D28 — BREAKING: the "scrapable public source" filter is a no-op as specified.
+
+Measured over all 12,564 live series: **12,557 (99.94%) publish a
+`settlement_sources` entry with a non-empty URL.** Filtering on the presence of
+a settlement source removes **7 series**. The spec leans on this filter as one
+of its four load-bearing screens; as written it screens nothing.
+
+The signal is in the *shape* of the URL, not its existence. Across the 2,230
+recurring series, 2,357 settlement URLs point at a bare homepage and only 1,257
+carry a real path. `KXIMOCOUNTRY` settles to `https://www.wsj.com/` — a
+newsroom front page, not a data endpoint.
+
+Domain is what discriminates:
+
+| scrapable | count | media homepage | count |
+|---|---:|---|---:|
+| bls.gov | 204 | espn.com | 503 |
+| forecast.weather.gov + weather.gov | 98 | foxsports.com | 245 |
+| cfbenchmarks.com | 139 | wsj.com | 159 |
+| fred.stlouisfed.org | 37 | apnews.com | 121 |
+
+Consequence: `settlement_source_type` is derived from a domain allowlist
+(`lib/classify_rules.py`), not from the presence of a source.
+
+## D29 — `fee_type: quadratic_with_maker_fees` is a free disqualifier.
+
+130 series charge makers as well as takers (107 of them Sports). The premise of
+the screen is that a *passive* seat earns; paying maker fees inverts that. The
+field is published per series, so this costs nothing to check, and `v_screen`
+now excludes it. Upgrades U2 from "flagged, not modeled" to an actual filter.
+
+## D30 — Two classifier bugs found by CP5, and CP5's own scope was wrong.
+
+Running the deterministic rules against the real payloads surfaced three
+distinct faults:
+
+1. **Exact domain matching silently misroutes subdomains.** `KXHIGHUS` settles
+   to `wpc.ncep.noaa.gov`, which does not equal `noaa.gov`, so it fell to
+   `unknown`. Domain tests must be suffix matches.
+2. **Category is not a reliable benchmark proxy.** `KXHIGHNY0` ("NYC high
+   temperature") is filed under category `World`, not `Climate and Weather`, so
+   a category-keyed rule gave it `benchmark = unknown`. The settlement domain
+   has to win over the category label.
+3. **`v_cp5_ground_truth` matched the wrong series.** `like 'KXLOW%'` also
+   matches **Lowe's** — `KXLOW`, `KXLOWA` ("Lowe's Annual KPI"), `KXLOWCC`
+   ("Lowe's Credit Card Spend") — and `like 'KXHIGH%'` matches `KXHIGHMOVDJT`
+   ("Highest margin of victory"). Those are one_off Financials/Politics series
+   that *correctly* fail the temperature check, so the gate read 50/61 and
+   indicted a working classifier. Scoped to `category = 'Climate and Weather'`
+   it reads **52/53** — the residual is `KXHIGHTEMPDEN`, frequency `custom`,
+   which D9 leaves ambiguous by design.
+
+## D31 — Summed volume cannot distinguish a live ladder from a dead one.
+
+`v_series_activity` originally took the median spread across *every* open
+market and summed volume across all of them. Both mislead on wide strike
+ladders.
+
+`KXUE` (Monthly Unemployment) ranked **first** on median spread at 60¢ — which
+looked like a large maker opportunity. In fact only **7 of its 68 open markets
+had any 24h volume at all**, and 94% of that volume sat in a single contract.
+The 60¢ was the width of dead strikes nobody quotes. `KXCPICORE` was the same
+shape (8 of 55 live). Meanwhile `KXHIGHTDC` had 12 of 12 live at a 1¢ spread.
+
+Two fixes: spread is now measured only over markets with `volume_24h > 0`, and
+`breadth` (live markets ÷ open markets) plus `top_market_share` are exposed and
+filtered at `breadth >= 0.34`. Without this the screen ranks dead ladders top.
+
+## D32 — Job C's series scope was effectively unbounded.
+
+`recurring_series()` selected `frequency not in ('one_off','')`, which admits
+`custom` — 5,387 of 12,564 series — so the walk covered **7,617 series** rather
+than the 643 that actually recur and trade. It also admitted the
+high-frequency crypto ladders: `KXSOLE` alone carries **350 open strikes**,
+which at hourly × 180 days is on the order of a million markets for one series.
+
+Scope is now three-tier: `BACKFILL_SERIES` (explicit), `BACKFILL_FROM_SCREEN=1`
+(the surviving candidates), or recurring frequencies only. Scoped to the ~85
+survivors the backfill is ~91k markets and ~64k tape requests — hours, not
+weeks.
+
 ---
 
 ## Unresolved / carried forward
@@ -383,10 +464,10 @@ instead (`mve_collection_ticker` is set on them). `/markets` accepts
   KXHIGHNY, but it is not a fixed global age — KXJOBLESS returns nothing live
   at any age, while high-volume series stay live longer. Treat the archive as
   the authority for anything older than a few weeks.
-- **U2 — `fee_type: quadratic_with_maker_fees`** (130 series) charges makers too.
-  Our metric reports *taker* bleed, so maker fees don't enter the taker PnL — but
-  "maker PnL ≈ −taker PnL" (§7) overstates maker economics on these 130 series.
-  Flagged, not modeled, per §12.
+- **U2 — RESOLVED by D29.** `fee_type: quadratic_with_maker_fees` (130 series)
+  charges makers too, so "maker PnL ≈ −taker PnL" (§7) overstates maker
+  economics there. Rather than model it, `v_screen` now excludes those series
+  outright — a passive seat paying maker fees is not the thing being screened for.
 - **U3 — exact fee schedule PDF** not diffed. §7 explicitly permits the
   approximation for v1; `fee_multiplier` (D10) closes the worst error.
 - **U4 — `frequency: "custom"`** covers 5,387 series and is genuinely ambiguous;
