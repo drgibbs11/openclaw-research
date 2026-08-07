@@ -5,6 +5,7 @@
     "buildCommand": "pip install -r requirements.txt"
   },
   "deploy": {
+    "startCommand": "python -c \"import sys; sys.exit('This repo has no default service. Set Config-as-code path to railway/<job>.json -- see README > Deploying to Railway.')\"",
     "restartPolicyType": "NEVER"
   }
 }

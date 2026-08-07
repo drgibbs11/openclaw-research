@@ -22,7 +22,7 @@ fixtures/*.json         captured live responses, verbatim
 DISCREPANCIES.md        every place the build spec and the live API disagree
 sql/001_schema.sql      DDL
 sql/010_views.sql       v_series_activity, v_taker_bleed, v_screen + diagnostics
-sql/020_prune.sql       snapshot retention — run daily
+sql/020_prune.sql       snapshot retention — psql-only variant of jobs/prune.py
 lib/kalshi.py           paginated GET client — throttle, backoff, cursor paging
 lib/bleed.py            the taker-bleed metric
 lib/tape.py             shared tape aggregation for Jobs B and C
@@ -33,6 +33,8 @@ jobs/snapshot.py        Job A — every 6h
 jobs/settled_sweep.py   Job B — daily
 jobs/backfill.py        Job C — one-time, resumable
 jobs/classify.py        Job D — one-time + weekly top-up
+jobs/prune.py           retention — daily; the Railway-safe prune
+railway/*.json          one Railway cron service per job
 tools/cp3_handcheck.py  CP3 gate: verifies the PnL math against real tapes
 tools/smoke_test.py     offline check of client + mappers against the live API
 ```
@@ -79,6 +81,9 @@ harmless on a direct connection.
 | `TERMINAL_MIN_VOLUME` | `1` | Skip never-traded settled markets; `0` keeps everything (see Storage) |
 | `BACKFILL_SERIES` | — | Comma-separated explicit scope for Job C |
 | `BACKFILL_FROM_SCREEN` | — | Scope Job C to surviving screen candidates |
+| `PRUNE_DAYS` | `30` | Snapshot retention window |
+| `PRUNE_BATCH` | `200000` | Rows per delete transaction |
+| `PRUNE_SKIP_VACUUM` | — | Skip the vacuum (see the pooler note below) |
 | `SCREENER_SCHEMA` | `screener` | Postgres schema; never `public` |
 
 ## Running
@@ -86,8 +91,16 @@ harmless on a direct connection.
 ```bash
 python jobs/snapshot.py        # Job A — cron: 0 */6 * * *
 python jobs/settled_sweep.py   # Job B — cron: 30 6 * * *
-python jobs/backfill.py        # Job C — manual, resumable
+python jobs/backfill.py        # Job C — manual, resumable, SCOPE IT (D32)
 python jobs/classify.py        # Job D — rules pass, no API key, idempotent
+python jobs/prune.py           # retention — cron: 0 5 * * *
+```
+
+First run, in order — Job D needs Job A's series, Job C needs Job D's tags:
+
+```bash
+python jobs/snapshot.py && python jobs/classify.py --all
+BACKFILL_FROM_SCREEN=1 python jobs/backfill.py
 ```
 
 ### Job C reads the archive, not the live endpoint
@@ -155,6 +168,49 @@ python tools/smoke_test.py     # client + mappers vs. the live API
 python tools/cp3_handcheck.py  # CP3 gate — PnL math vs. real tapes
 ```
 
+## Deploying to Railway
+
+Each job is a **separate Railway cron service** pointed at this same repo, with
+its own config file. Railway runs one service per schedule; there is no way to
+express four schedules in a single service.
+
+For each row: New Service → GitHub Repo → this repo → Settings → **Config as
+code** → set the path, then add `DATABASE_URL` to that service's variables.
+
+| service | config path | schedule (UTC) | runs |
+|---|---|---|---|
+| snapshot | `railway/snapshot.json` | `0 */6 * * *` | Job A, ~5 min |
+| settled-sweep | `railway/settled_sweep.json` | `30 6 * * *` | Job B, up to ~1 h |
+| classify | `railway/classify.json` | `0 7 * * 1` | Job D, seconds |
+| prune | `railway/prune.json` | `0 5 * * *` | retention |
+
+`railway.json` at the root is deliberately **not** a working service — it exits
+with a message telling you to set a config path. A service deployed without one
+fails loudly instead of silently running nothing.
+
+Job C is not a cron job. It is a one-time multi-hour run — use `railway run
+python jobs/backfill.py` against a service that has `DATABASE_URL`, or just run
+it locally. Run it *after* classify, so there is a candidate set to scope to.
+
+Things that bite:
+
+- **Cron jobs must exit.** Railway skips a scheduled run if the previous one is
+  still going. All four jobs exit; all four return exit code 1 on failure, so a
+  failed run is marked failed rather than passing silently. `restartPolicyType`
+  is `NEVER` in every config — with the default policy Railway restarts a
+  completed job forever.
+- **Schedules are UTC**, not your local time.
+- **Don't use `sql/020_prune.sql` on Railway.** It uses psql meta-commands
+  (`\if`, `\set`) that only the psql *client* understands, and the Nixpacks
+  Python image has no psql. `jobs/prune.py` does the same work over psycopg,
+  batched and committing as it goes. The SQL file is still there for running by
+  hand from a machine that has psql.
+- **The vacuum wants a direct connection.** `VACUUM` behaves badly through
+  Supabase's transaction pooler (6543). If the prune service logs a vacuum
+  failure, either point that one service at the direct connection (5432) or set
+  `PRUNE_SKIP_VACUUM=1` and let autovacuum reclaim. The delete is already
+  committed either way — a failed vacuum never loses work.
+
 ## Deployment status
 
 The `screener` schema is **live on Supabase** (project `iusnbmsmbgkevjjlpmck`):
@@ -167,17 +223,21 @@ prove the views compute on live data. **Those activity numbers are not the true
 series totals** — the seed caps at 12 markets per series, so anything with a
 wider ladder is undercounted. Real numbers arrive with the first Job A run.
 
-Still to do. `DATABASE_URL` is the only credential involved:
+**Nothing is running yet.** No Railway project exists, and no pipeline run has
+been persisted — `series_tags` is empty and `market_snapshots` holds only the
+66-row seed. The code is committed and the checkpoints that don't need a
+database pass (CP3, CP4), but the screener has never executed end to end.
+
+`DATABASE_URL` is the only credential involved:
 
 | | needs |
 |---|---|
-| Job A / B on cron | `DATABASE_URL` (the Postgres connection string, not the MCP link) |
-| Job D classify | same — deterministic rules, no API key (D28) |
-| Job C backfill | same, then run manually and **scoped** (D32) |
-| Daily prune | `sql/020_prune.sql` as a cron step |
+| Railway services | create 4, set config paths, add `DATABASE_URL` (above) |
+| Job D classify | nothing else — deterministic rules, no API key (D28) |
+| Job C backfill | run manually and **scoped** (D32), after Job D |
 
-Run order matters: **A → D → C**. Job D is what produces the candidate set that
-Job C scopes against, and Job C unscoped does not finish.
+Run order matters: **A → D → C**. Job D produces the candidate set that Job C
+scopes against, and Job C unscoped does not finish.
 
 ## Storage
 
@@ -199,7 +259,8 @@ about 35 days. Two levers, both off by default:
 only reads the last 24 hours. Everything older is history. Run daily:
 
 ```bash
-psql "$DATABASE_URL" -v days=30 -f sql/020_prune.sql
+python jobs/prune.py                  # anywhere, incl. Railway cron
+psql "$DATABASE_URL" -v days=30 -f sql/020_prune.sql   # needs the psql client
 ```
 
 Caps `market_snapshots` at ~2.6 GB steady state instead of growing forever

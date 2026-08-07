@@ -1,4 +1,9 @@
--- Retention. Run daily (Railway cron, alongside Job B).
+-- Retention, psql variant. For running by hand from a machine that has psql.
+--
+-- NOT the Railway path: the \if/\set below are psql *client* meta-commands, and
+-- the Nixpacks Python image Railway builds ships no psql, so this cannot run as
+-- a cron step. Use jobs/prune.py there — same work over psycopg, batched, and
+-- it vacuums afterwards.
 --
 -- market_snapshots is the only append-only table that grows without bound:
 -- ~78k open markets x 4 runs/day x ~296 bytes = ~92 MB/day, ~2.8 GB/month.
