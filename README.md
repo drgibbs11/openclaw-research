@@ -175,14 +175,19 @@ its own config file. Railway runs one service per schedule; there is no way to
 express four schedules in a single service.
 
 For each row: New Service → GitHub Repo → this repo → Settings → **Config as
-code** → set the path, then add `DATABASE_URL` to that service's variables.
+code** → set the path (Railway wants an **absolute repo path**, leading slash),
+then add `DATABASE_URL` to that service's variables.
 
 | service | config path | schedule (UTC) | runs |
 |---|---|---|---|
-| snapshot | `railway/snapshot.json` | `0 */6 * * *` | Job A, ~5 min |
-| settled-sweep | `railway/settled_sweep.json` | `30 6 * * *` | Job B, up to ~1 h |
-| classify | `railway/classify.json` | `0 7 * * 1` | Job D, seconds |
-| prune | `railway/prune.json` | `0 5 * * *` | retention |
+| snapshot | `/railway/snapshot.json` | `0 */6 * * *` | Job A, ~5 min |
+| settled-sweep | `/railway/settled_sweep.json` | `30 6 * * *` | Job B, up to ~1 h |
+| classify | `/railway/classify.json` | `0 7 * * 1` | Job D, seconds |
+| prune | `/railway/prune.json` | `0 5 * * *` | retention |
+
+Builder is `RAILPACK` — the only non-Dockerfile value Railway still accepts,
+and it detects `requirements.txt` and installs dependencies on its own, so no
+`buildCommand` is set.
 
 `railway.json` at the root is deliberately **not** a working service — it exits
 with a message telling you to set a config path. A service deployed without one
@@ -195,11 +200,14 @@ it locally. Run it *after* classify, so there is a candidate set to scope to.
 Things that bite:
 
 - **Cron jobs must exit.** Railway skips a scheduled run if the previous one is
-  still going. All four jobs exit; all four return exit code 1 on failure, so a
-  failed run is marked failed rather than passing silently. `restartPolicyType`
+  still `Active`. All four jobs exit; all four return exit code 1 on failure, so
+  a failed run is marked failed rather than passing silently. `restartPolicyType`
   is `NEVER` in every config — with the default policy Railway restarts a
   completed job forever.
-- **Schedules are UTC**, not your local time.
+- **Schedules are UTC**, minimum interval 5 minutes, and Railway does not
+  promise to-the-minute precision — runs can drift by a few minutes. Nothing
+  here is timing-sensitive, but Job B's cursor overlap (2 h) exists partly for
+  this reason.
 - **Don't use `sql/020_prune.sql` on Railway.** It uses psql meta-commands
   (`\if`, `\set`) that only the psql *client* understands, and the Nixpacks
   Python image has no psql. `jobs/prune.py` does the same work over psycopg,
