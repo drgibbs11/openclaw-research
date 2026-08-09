@@ -222,6 +222,27 @@ Things that bite:
   failure, either point that one service at the direct connection (5432) or set
   `PRUNE_SKIP_VACUUM=1` and let autovacuum reclaim. The delete is already
   committed either way — a failed vacuum never loses work.
+- **Supabase network restrictions block Railway by default.** The target project
+  has an IP allow list, and Railway's egress addresses are not on it, so every
+  job dies at `db.connect()` before authenticating:
+
+  ```
+  FATAL: (EADDRNOTALLOWED) address not in tenant allow_list: {152, 55, 176, 218}
+  ```
+
+  This is not a credential problem — `DATABASE_URL` is never exercised. It
+  applies to **every** connection route, pooled and direct, so switching 6543
+  for 5432 does not help. Railway egress is dynamic unless you turn on Static
+  Outbound IPs (Pro, per service, region-bound), so allow-listing one observed
+  address only works until the next reschedule. Fix: enable Static Outbound IPs
+  on each screener service, redeploy, then add those IPv4 addresses under
+  Supabase → Database Settings → Network Restrictions. IPv4 alone is enough
+  while `ipv6EgressEnabled` is false on the services.
+- **A redeploy does not run a cron service.** It only re-arms it, and reports
+  `SUCCESS` for the deployment while the job never executes. To force a run,
+  retime the service's cron schedule — that takes effect on the service setting
+  without a deploy, so the config file does not overwrite it — then restore the
+  real schedule afterwards.
 
 ## Deployment status
 
@@ -235,16 +256,29 @@ prove the views compute on live data. **Those activity numbers are not the true
 series totals** — the seed caps at 12 markets per series, so anything with a
 wider ladder is undercounted. Real numbers arrive with the first Job A run.
 
-**Nothing is running yet.** No Railway project exists, and no pipeline run has
-been persisted — `series_tags` is empty and `market_snapshots` holds only the
-66-row seed. The code is committed and the checkpoints that don't need a
-database pass (CP3, CP4), but the screener has never executed end to end.
+**Railway is deployed; the pipeline is still blocked.** The `OpenClaw` project
+holds four `screener-*` cron services, each on its config-as-code path with
+`DATABASE_URL` set, all building clean from `main`. Verified 2026-08-09.
 
-`DATABASE_URL` is the only credential involved:
+**No pipeline run has persisted yet.** `series_tags` is empty and
+`market_snapshots` holds only the 66-row seed, which has since aged out of
+`v_latest_snapshot`'s 24-hour window — so `v_screen_funnel` reports
+`series_total = 8` and zero at every later stage, and `v_ingest_health` shows
+the snapshot age climbing. That is the designed failure mode, not a broken
+filter: the funnel is empty because ingest never landed.
+
+The blocker is the Supabase IP allow list (see *Things that bite*). A forced
+Job A run on 2026-08-09 crashed in under a second at `db.connect()` with
+`EADDRNOTALLOWED`. Until Railway's egress is allow-listed, every scheduled run
+will fail the same way — loudly, exit 1, no partial writes.
+
+`DATABASE_URL` is the only credential involved, but it is not sufficient on its
+own — the network path has to be open too:
 
 | | needs |
 |---|---|
-| Railway services | create 4, set config paths, add `DATABASE_URL` (above) |
+| Railway services | ✅ created, config paths set, `DATABASE_URL` added |
+| Network path | ⛔ Static Outbound IPs + Supabase allow list (above) |
 | Job D classify | nothing else — deterministic rules, no API key (D28) |
 | Job C backfill | run manually and **scoped** (D32), after Job D |
 
