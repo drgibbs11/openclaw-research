@@ -621,3 +621,50 @@ Two things left alone deliberately:
   has already produced settles it without guessing. Series below the floor
   still land in `unknown`, so the ambiguity is narrowed rather than papered
   over.
+
+---
+
+## D36 — a dropped connection hangs the job instead of failing it.
+
+Job C ran cleanly for three and a half hours, reached 36,200 of 54,522 markets,
+and then stopped dead. No exception, no log line, no exit. CPU fell to 0.0002
+and memory froze at 0.08402944 GB — identical across 61 consecutive samples —
+and stayed that way for 90 minutes until the run was killed.
+
+It was not the API client. `KalshiClient.get()` sets `timeout=45`, bounds
+retries, and logs a warning on every retry path, so a stall there would have
+left a trail. There was nothing after `aggregated 36200/54522`.
+
+`aggregate_all()` commits *before* it logs:
+
+```python
+if done % 25 == 0:
+    conn.commit()
+    db.set_job_cursor(...)
+    conn.commit()
+    log.info("aggregated %d/%d ...")
+```
+
+so a hang inside the commit leaves exactly this signature — the previous
+batch's line as the last thing written.
+
+`psycopg.connect()` was called with no `connect_timeout` and no TCP keepalives.
+When Supabase's pooler drops a connection the client blocks forever on a socket
+read that will never return: no timeout, so no exception, so nothing to log and
+nothing to exit with.
+
+The failure shape is the problem as much as the failure. A crash would have
+been fine — every job here exits 1 on error and a failed run is visible as
+failed. A silent stall is invisible: `restartPolicyType: NEVER` means nothing
+restarts it, Railway still reports the deployment `SUCCESS`, and the only
+symptom is a row count that stops moving. This one was caught by a scheduled
+check comparing log timestamps against wall clock, not by anything the system
+reports on its own.
+
+`connect()` now sets `connect_timeout=15` and keepalives (`idle=30`,
+`interval=10`, `count=5`), so a dead peer surfaces as an `OperationalError`
+within ~80 seconds and the job fails loudly like every other error path.
+
+Job C is resumable — `pending_markets()` skips anything already in
+`market_taker_stats` — so the recovery is a redeploy, and the cost of the stall
+was wall-clock only.
