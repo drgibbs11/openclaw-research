@@ -36,9 +36,33 @@ def dsn() -> str:
 SCHEMA = os.environ.get("SCREENER_SCHEMA", "screener")
 
 
+# A dropped connection must raise, not hang. Job C ran for 3.5 hours and then
+# stopped dead mid-run: zero CPU, memory frozen to the byte, no further log
+# lines and no exception, for 90 minutes until it was killed. psycopg sets no
+# socket timeout by default, so when the pooler drops a connection the client
+# blocks forever on a read that will never return (D36).
+#
+# It stalls silently rather than crashing, which is the worst shape for a cron
+# worker: `restartPolicyType: NEVER` means nothing restarts it and Railway
+# still reports the deployment as SUCCESS, so a run can be dead for hours and
+# look healthy from the outside.
+#
+# keepalives detect a dead peer in roughly 30 + 5x10 = 80s and surface it as an
+# OperationalError, which the job then fails on loudly with exit 1 — the
+# behaviour every other failure path here already has.
+CONNECT_KWARGS = {
+    "connect_timeout": 15,
+    "keepalives": 1,
+    "keepalives_idle": 30,
+    "keepalives_interval": 10,
+    "keepalives_count": 5,
+}
+
+
 @contextmanager
 def connect(autocommit: bool = False):
-    conn = psycopg.connect(dsn(), prepare_threshold=None, autocommit=autocommit)
+    conn = psycopg.connect(dsn(), prepare_threshold=None, autocommit=autocommit,
+                           **CONNECT_KWARGS)
     try:
         with conn.cursor() as cur:
             cur.execute(f"set search_path to {SCHEMA}")
