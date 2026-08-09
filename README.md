@@ -35,7 +35,7 @@ jobs/settled_sweep.py   Job B — daily
 jobs/backfill.py        Job C — one-time, resumable
 jobs/classify.py        Job D — one-time + weekly top-up
 jobs/prune.py           retention — worker variant; deployed path is pg_cron
-railway/*.json          one Railway cron service per job (3 deployed)
+railway/*.json          one Railway service per job (4 deployed + backfill)
 tools/cp3_handcheck.py  CP3 gate: verifies the PnL math against real tapes
 tools/smoke_test.py     offline check of client + mappers against the live API
 ```
@@ -181,13 +181,16 @@ then add `DATABASE_URL` to that service's variables.
 
 | service | config path | schedule (UTC) | runs |
 |---|---|---|---|
-| snapshot | `/railway/snapshot.json` | `0 */6 * * *` | Job A, ~5 min |
+| snapshot | `/railway/snapshot.json` | `0 */6 * * *` | Job A, ~15 min |
 | settled-sweep | `/railway/settled_sweep.json` | `30 6 * * *` | Job B, up to ~1 h |
 | classify | `/railway/classify.json` | `0 7 * * 1` | Job D, seconds |
+| backfill | `/railway/backfill.json` | *none* | Job C, hours, one-shot |
 
 **Retention is not a Railway service.** It runs as two `pg_cron` jobs inside
 Postgres — see Storage below. `railway/prune.json` is kept for anyone who wants
-it as a worker instead, but the deployed setup does not use it.
+it as a worker instead, but the deployed setup does not use it, and the
+`screener-prune` service that briefly existed has been deleted: it duplicated
+the pg_cron delete and its `VACUUM` could not work through the pooler anyway.
 
 Builder is `RAILPACK` — the only non-Dockerfile value Railway still accepts,
 and it detects `requirements.txt` and installs dependencies on its own, so no
@@ -197,9 +200,13 @@ and it detects `requirements.txt` and installs dependencies on its own, so no
 with a message telling you to set a config path. A service deployed without one
 fails loudly instead of silently running nothing.
 
-Job C is not a cron job. It is a one-time multi-hour run — use `railway run
-python jobs/backfill.py` against a service that has `DATABASE_URL`, or just run
-it locally. Run it *after* classify, so there is a candidate set to scope to.
+Job C is not a cron job. It is a one-time multi-hour run. `railway/backfill.json`
+carries no `cronSchedule`, so the service runs its start command once when
+deployed and `restartPolicyType: NEVER` stops Railway restarting it on
+completion — redeploy the service to start another run. `railway run python
+jobs/backfill.py` and a local run both still work. Run it *after* classify, so
+there is a candidate set to scope to, and set `BACKFILL_SERIES` or
+`BACKFILL_FROM_SCREEN=1` first (D32).
 
 Things that bite:
 
@@ -251,39 +258,68 @@ The `screener` schema is **live on Supabase** (project `iusnbmsmbgkevjjlpmck`):
 `screener_views_init`. `public` was not touched — 80 tables before and after,
 and `public.market_snapshots` still holds its 89,574 rows.
 
-Seeded with a small real sample (8 series, 66 open-market snapshots) purely to
-prove the views compute on live data. **Those activity numbers are not the true
-series totals** — the seed caps at 12 markets per series, so anything with a
-wider ladder is undercounted. Real numbers arrive with the first Job A run.
+**Jobs A and D have run for real** (2026-08-09). The original 8-series, 66-row
+seed is gone from the numbers below; these are live totals.
 
-**Railway is deployed; the pipeline is still blocked.** The `OpenClaw` project
-holds four `screener-*` cron services, each on its config-as-code path with
-`DATABASE_URL` set, all building clean from `main`. Verified 2026-08-09.
+| table | rows |
+|---|---:|
+| `series` | 12,573 |
+| `events` | 546,270 |
+| `market_snapshots` | 77,891 |
+| `series_tags` | 7,624 |
+| `markets_terminal` | 0 — needs Job B or C |
+| `market_taker_stats` | 0 — needs Job B or C |
 
-**No pipeline run has persisted yet.** `series_tags` is empty and
-`market_snapshots` holds only the 66-row seed, which has since aged out of
-`v_latest_snapshot`'s 24-hour window — so `v_screen_funnel` reports
-`series_total = 8` and zero at every later stage, and `v_ingest_health` shows
-the snapshot age climbing. That is the designed failure mode, not a broken
-filter: the funnel is empty because ingest never landed.
+Job A took ~15 minutes rather than the estimated ~5, almost entirely spent
+being rate-limited on `/events`: the client oscillates between 5 and 2.5 req/s
+against a steady stream of 429s. It reported `unmapped series: 103` — markets
+whose series was not resolvable at write time (D25's orphaning, worth a look
+before trusting per-series totals at the margin).
 
-The blocker is the Supabase IP allow list (see *Things that bite*). A forced
-Job A run on 2026-08-09 crashed in under a second at `db.connect()` with
-`EADDRNOTALLOWED`. Until Railway's egress is allow-listed, every scheduled run
-will fail the same way — loudly, exit 1, no partial writes.
+`v_screen_funnel` after both runs:
 
-`DATABASE_URL` is the only credential involved, but it is not sufficient on its
-own — the network path has to be open too:
+```
+ series_total | classified | recurring | no_benchmark | scrapable | no_maker_fees
+        12573 |       7624 |      2231 |          443 |       349 |           345
+
+ in_volume_band | ladder_alive | enough_settled | passes_all
+            723 |          521 |              0 |          0
+```
+
+**`passes_all = 0` is the bleed half, not a defect.** Every activity-side filter
+is producing sensible numbers. `enough_settled` requires `n_settled >= 20` from
+`v_taker_bleed`, which reads `markets_terminal` — and Job A only snapshots
+*open* markets. Settled history comes from Job B (daily, accumulates slowly) or
+Job C (backfill, available now). Until one of them runs there is no tape to
+compute taker bleed against, and the screen needs both halves.
+
+The Supabase IP allow list that blocked every earlier run is resolved: Static
+Outbound IPs are enabled on the services and their addresses are allow-listed.
+
+`DATABASE_URL` is still the only credential, but it is no longer the `postgres`
+superuser. The services authenticate as **`screener_app`**, a role with `USAGE`
+on `screener` and DML on its tables and nothing else — verified as unable to
+read `public.market_snapshots`, which belongs to the live weather-trading
+system sharing this database. Supabase's pooler accepts custom roles in the
+same `<role>.<project_ref>` username form as `postgres`.
 
 | | needs |
 |---|---|
 | Railway services | ✅ created, config paths set, `DATABASE_URL` added |
-| Network path | ⛔ Static Outbound IPs + Supabase allow list (above) |
-| Job D classify | nothing else — deterministic rules, no API key (D28) |
-| Job C backfill | run manually and **scoped** (D32), after Job D |
+| Network path | ✅ Static Outbound IPs allow-listed on Supabase |
+| Credentials | ✅ scoped `screener_app` role, not `postgres` |
+| Job D classify | ✅ ran — 7,624 tagged |
+| Job C backfill | ⛔ the only thing between here and a populated screen |
 
 Run order matters: **A → D → C**. Job D produces the candidate set that Job C
 scopes against, and Job C unscoped does not finish.
+
+The candidate set is **56 series** — the `BACKFILL_FROM_SCREEN` filters plus the
+three D33 recovers. It is overwhelmingly city temperature highs and lows
+(`KXHIGHT*`, `KXLOWT*`), rain, and monthly ranges: settle to `weather.gov`, no
+sharp external book to be marked against, and a ladder that actually trades.
+That is precisely the profile §1 describes, arrived at from live data rather
+than assumed. `screener-backfill` is configured against exactly this list.
 
 ## Storage
 
@@ -367,10 +403,10 @@ reconciles tape contracts against each market's reported volume.
 | | Gate | Status |
 |---|---|---|
 | CP1 | Spec + fixtures vendored, diffed, DDL written | done — see `DISCREPANCIES.md` |
-| CP2 | Job A on cron, two runs, spot-check 3 tickers | needs `DATABASE_URL` |
+| CP2 | Job A on cron, two runs, spot-check 3 tickers | **one run done** — second run 18:00 UTC |
 | CP3 | Tape math matches hand-computed PnL to the cent | **passing** — `tools/cp3_handcheck.py` |
-| CP4 | Job D complete, ≥25-row human review under 10% error | needs `DATABASE_URL` |
-| CP5 | `v_screen` returns rows; temperature series classify correctly | needs CP2–CP4 |
+| CP4 | Job D complete, ≥25-row human review under 10% error | Job D **done** (7,624); review outstanding |
+| CP5 | `v_screen` returns rows; temperature series classify correctly | blocked on Job C — see Deployment status |
 
 `v_screen_funnel` shows how many series survive each filter, so an empty screen
 tells you which stage emptied it. `v_cp5_ground_truth` is the built-in check
