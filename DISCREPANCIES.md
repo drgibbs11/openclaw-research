@@ -556,6 +556,53 @@ commodity and awards series verified still excluded. `RULES_VERSION` is
 
 ---
 
+## D35 — `BACKFILL_SERIES` did not bound the half of Job C that costs anything.
+
+D32 scoped the *ingest*. `pending_markets()` was never scoped at all — it
+selected from `markets_terminal` on settlement window and volume alone. That
+would be harmless if `markets_terminal` only held the scoped series, but
+`main()` runs two ingests:
+
+```python
+if BACKFILL_SOURCE != "recent":
+    ingest_archive(conn, client, since)   # scoped to BACKFILL_SERIES
+ingest(conn, client, since)               # global page-walk, unscoped
+```
+
+The second is described in-code as "one cheap global page-walk", and it is
+cheap *to ingest*. What it is not is cheap downstream: it writes every settled
+market on the exchange inside the window, and phase 2 then queues one tape
+request per traded market across all of them.
+
+Measured on the first real run, scoped to 70 series:
+
+| | markets | series |
+|---|---:|---|
+| archive walk (scoped, correct) | 59,054 | 70 |
+| `markets_terminal` after the global walk | 749,654 | 561 |
+| phase 2 worklist as written | 239,526 | 561 |
+| phase 2 worklist scoped | **52,707** | 70 |
+
+At the client's 5 req/s ceiling — and it spends most of its time throttled to
+2.5 by 429s — that is the difference between roughly 3–6 hours and 13–26, with
+about 78% of the work spent on series that cannot reach the screen. 59 of the
+70 in-scope series already carry the 20+ settled markets `v_screen` requires,
+so the scoped worklist loses nothing the screen can use.
+
+`pending_markets()` now takes the same scope the ingest used.
+
+Two things left alone deliberately:
+
+- The global recent walk still runs. It is genuinely cheap, and D26 means the
+  archive can lag on very recently settled markets. It costs storage, not
+  hours, and `TERMINAL_MIN_VOLUME` already governs that trade.
+- `order by mt.volume asc` is §6's ordering and stays. Worth knowing when
+  watching a run, though: the cheapest and least informative markets are taped
+  first, so partial progress is not representative — a run killed at 50% has
+  the *low* half of the volume distribution, not a random half.
+
+---
+
 ## Unresolved / carried forward
 
 - **U1 — RESOLVED by D26.** The `/historical/*` split is a retention boundary

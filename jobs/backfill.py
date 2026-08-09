@@ -201,9 +201,20 @@ def ingest(conn, client: KalshiClient, since: datetime) -> int:
     return total
 
 
-def pending_markets(conn, since: datetime, exclude: set[str]) -> list[dict]:
-    """Phase 2 worklist: not yet aggregated, ascending volume (§6)."""
-    sql = """
+def pending_markets(conn, since: datetime, exclude: set[str],
+                    scope: list[str] | None = None) -> list[dict]:
+    """Phase 2 worklist: not yet aggregated, ascending volume (§6).
+
+    Scoped to the same series the ingest was scoped to. D32 bounded the ingest
+    and left this unbounded, which meant `BACKFILL_SERIES` did not actually
+    bound the expensive half of the job: `ingest()` is a *global* page-walk, so
+    markets_terminal fills with every settled market on the exchange and this
+    query then queued a tape request for all of them. Measured on the first
+    real run — 239,526 markets queued across 561 series when 70 were asked for,
+    of which 52,707 were in scope (D35).
+    """
+    scoped = "and mt.series_ticker = any(%s)" if scope else ""
+    sql = f"""
         select mt.ticker, mt.result, mt.series_ticker, mt.volume, coalesce(s.category, '')
         from markets_terminal mt
         left join series s on s.series_ticker = mt.series_ticker
@@ -211,10 +222,14 @@ def pending_markets(conn, since: datetime, exclude: set[str]) -> list[dict]:
         where st.ticker is null
           and mt.settlement_ts >= %s
           and coalesce(mt.volume, 0) >= %s
+          {scoped}
         order by mt.volume asc nulls first
     """
+    params: list = [since, MIN_VOLUME]
+    if scope:
+        params.append(list(scope))
     with conn.cursor() as cur:
-        cur.execute(sql, (since, MIN_VOLUME))
+        cur.execute(sql, params)
         rows = cur.fetchall()
 
     out = []
@@ -265,8 +280,13 @@ def main() -> int:
                 ingest_archive(conn, client, since)
             ingest(conn, client, since)
 
-        markets = pending_markets(conn, since, exclude)
-        log.info("phase 2 worklist: %d markets", len(markets))
+        # Same scope the ingest used. Without this the global recent walk's
+        # output dominates the worklist and BACKFILL_SERIES bounds nothing
+        # that costs anything (D35).
+        scope = recurring_series(conn)
+        markets = pending_markets(conn, since, exclude, scope)
+        log.info("phase 2 worklist: %d markets over %d series in scope",
+                 len(markets), len(scope))
         done, truncated = aggregate_all(conn, client, markets, page_cap)
         db.set_job_cursor(conn, JOB, cursor_ts=datetime.now(timezone.utc),
                           notes={"aggregated": done, "truncated": truncated, "complete": True})
