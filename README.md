@@ -23,6 +23,7 @@ DISCREPANCIES.md        every place the build spec and the live API disagree
 sql/001_schema.sql      DDL
 sql/010_views.sql       v_series_activity, v_taker_bleed, v_screen + diagnostics
 sql/020_prune.sql       snapshot retention — psql-only variant of jobs/prune.py
+sql/030_prune_cron.sql  retention as pg_cron jobs — the deployed path
 lib/kalshi.py           paginated GET client — throttle, backoff, cursor paging
 lib/bleed.py            the taker-bleed metric
 lib/tape.py             shared tape aggregation for Jobs B and C
@@ -33,8 +34,8 @@ jobs/snapshot.py        Job A — every 6h
 jobs/settled_sweep.py   Job B — daily
 jobs/backfill.py        Job C — one-time, resumable
 jobs/classify.py        Job D — one-time + weekly top-up
-jobs/prune.py           retention — daily; the Railway-safe prune
-railway/*.json          one Railway cron service per job
+jobs/prune.py           retention — worker variant; deployed path is pg_cron
+railway/*.json          one Railway cron service per job (3 deployed)
 tools/cp3_handcheck.py  CP3 gate: verifies the PnL math against real tapes
 tools/smoke_test.py     offline check of client + mappers against the live API
 ```
@@ -93,7 +94,7 @@ python jobs/snapshot.py        # Job A — cron: 0 */6 * * *
 python jobs/settled_sweep.py   # Job B — cron: 30 6 * * *
 python jobs/backfill.py        # Job C — manual, resumable, SCOPE IT (D32)
 python jobs/classify.py        # Job D — rules pass, no API key, idempotent
-python jobs/prune.py           # retention — cron: 0 5 * * *
+python jobs/prune.py           # retention — deployed as pg_cron, not a worker
 ```
 
 First run, in order — Job D needs Job A's series, Job C needs Job D's tags:
@@ -183,7 +184,10 @@ then add `DATABASE_URL` to that service's variables.
 | snapshot | `/railway/snapshot.json` | `0 */6 * * *` | Job A, ~5 min |
 | settled-sweep | `/railway/settled_sweep.json` | `30 6 * * *` | Job B, up to ~1 h |
 | classify | `/railway/classify.json` | `0 7 * * 1` | Job D, seconds |
-| prune | `/railway/prune.json` | `0 5 * * *` | retention |
+
+**Retention is not a Railway service.** It runs as two `pg_cron` jobs inside
+Postgres — see Storage below. `railway/prune.json` is kept for anyone who wants
+it as a worker instead, but the deployed setup does not use it.
 
 Builder is `RAILPACK` — the only non-Dockerfile value Railway still accepts,
 and it detects `requirements.txt` and installs dependencies on its own, so no
@@ -264,10 +268,28 @@ That is **6.9 GB/month, 84 GB/year** — it fills Supabase Pro's included 8 GB i
 about 35 days. Two levers, both off by default:
 
 **1. Prune snapshots (recommended, no information loss).** `v_series_activity`
-only reads the last 24 hours. Everything older is history. Run daily:
+only reads the last 24 hours. Everything older is history.
+
+**Deployed as two `pg_cron` jobs**, not a worker — `sql/030_prune_cron.sql`:
+
+```
+screener-prune-snapshots   0 5 * * *    delete beyond 30 days
+screener-vacuum-snapshots  20 5 * * *   vacuum (analyze)
+```
+
+In-database because `VACUUM` cannot run over PostgREST and misbehaves through
+the transaction pooler, so an external worker either skips it — leaving the
+heap at full size despite the DELETE — or needs a direct connection purely for
+one maintenance command. Two jobs rather than one because `VACUUM` cannot run
+inside a transaction block, so it cannot be chained onto the DELETE.
+
+Verified rather than assumed: a probe job scheduled two minutes out returned
+`status = succeeded`, `return_message = VACUUM`.
+
+Equivalents, if you'd rather run it outside the database:
 
 ```bash
-python jobs/prune.py                  # anywhere, incl. Railway cron
+python jobs/prune.py                                   # any Python host
 psql "$DATABASE_URL" -v days=30 -f sql/020_prune.sql   # needs the psql client
 ```
 
