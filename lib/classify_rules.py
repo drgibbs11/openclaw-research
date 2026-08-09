@@ -4,8 +4,10 @@ Job D originally asked a model to fill in `series_tags`. It doesn't need to.
 Measured against all 12,564 live series (see DISCREPANCIES D28):
 
   - `recurrence` was never a judgment call. `series.frequency` is a populated
-    enum, so it is read straight off the exchange (D9). Only `custom` is
-    genuinely ambiguous and it stays `unknown` rather than being guessed.
+    enum, so it is read straight off the exchange (D9). `custom` says nothing
+    either way, so it falls back to a second *structural* fact — how many
+    distinct events the series has actually produced (D33) — and stays
+    `unknown` when even that is unavailable. Nothing is guessed.
   - `settlement_source_type` is a function of the settlement URL's domain.
     99.94% of series publish one.
   - `scrape_difficulty` follows from the same domain.
@@ -27,7 +29,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-RULES_VERSION = "rules:v1"
+RULES_VERSION = "rules:v2"
 
 # --- settlement_source_type ------------------------------------------------
 # Structured numeric data you can poll and parse without a human in the loop.
@@ -73,6 +75,21 @@ RATES_DOMAINS = {"federalreserve.gov", "nber.org"}
 RECURRING_FREQUENCIES = {
     "fifteen_min", "hourly", "daily", "weekly", "monthly", "quarterly", "annual",
 }
+
+# `custom` is not a cadence, it is the absence of one, and 5,393 of 12,573 live
+# series carry it. Most are genuinely one-shot, but a minority are plainly
+# periodic — central bank decisions, monthly weather ranges — and D9's refusal
+# to guess was excluding them from the screen along with the rest (D33).
+#
+# A series that has already produced several distinct events is recurring as a
+# matter of observed record, which is a structural fact rather than an
+# inference. Measured over the live set: a floor of 6 recovers
+# KXCBDECISIONMEXICO, KXRAINMIAM and KXHMONTHRANGE — the only `custom` series
+# that clear every other screen filter — while reclassifying 931 series rather
+# than the 1,056 a floor of 4 would touch. Nothing downstream changes for a
+# reclassified series unless it also passes benchmark, settlement source,
+# volume band and breadth, so a loose floor cannot by itself widen the screen.
+RECURRING_EVENT_FLOOR = 6
 
 
 def domains(series: dict) -> set[str]:
@@ -150,26 +167,42 @@ def scrape_difficulty(series: dict) -> str:
 
 
 def recurrence(series: dict) -> str:
-    """D9: structural, never inferred. `custom` stays unknown by design."""
+    """D9: structural, never guessed.
+
+    `frequency` is authoritative whenever it says anything at all. `custom`
+    says nothing, so we read a second structural fact instead — the number of
+    distinct events the series has actually produced (D33). Callers that do not
+    supply `n_events` get the original behaviour: `custom` stays `unknown`.
+    """
     f = (series.get("frequency") or "").lower()
     if f == "one_off":
         return "one_off"
-    return "recurring" if f in RECURRING_FREQUENCIES else "unknown"
+    if f in RECURRING_FREQUENCIES:
+        return "recurring"
+    if f == "custom" and (series.get("n_events") or 0) >= RECURRING_EVENT_FLOOR:
+        return "recurring"
+    return "unknown"
 
 
 def classify(series: dict) -> dict:
     """Full tag row for one series. Pure function of the series payload."""
     bench, bench_name = benchmark(series)
     src = settlement_source_type(series)
+    rec = recurrence(series)
     note = f"{src}/{bench}"
     doms = sorted(domains(series))
     if doms:
         note += " via " + ",".join(doms[:3])
+    # Flag the D33 path explicitly. A `custom` series promoted to `recurring`
+    # rests on observed events rather than the exchange's own label, so a
+    # reviewer should be able to see that from the row alone.
+    if rec == "recurring" and (series.get("frequency") or "").lower() == "custom":
+        note += f" [recurrence from {series.get('n_events')} events]"
     return {
         "settlement_source_type": src,
         "benchmark": bench,
         "benchmark_name": bench_name,
-        "recurrence": recurrence(series),
+        "recurrence": rec,
         "scrape_difficulty": scrape_difficulty(series),
         "source_urls": source_urls(series),
         "notes": note[:200],

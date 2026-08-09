@@ -457,6 +457,43 @@ weeks.
 
 ---
 
+## D33 — `frequency: custom` was silently costing the screen real candidates.
+
+D9 reads `recurrence` straight off `series.frequency` and refuses to guess, so
+all 5,393 `custom` series land in `unknown`. `v_screen` requires
+`recurrence = 'recurring'`, which means every one of them is excluded — 43% of
+the live universe, dropped on the strength of a label the exchange declines to
+fill in.
+
+That is the right instinct and the wrong outcome. `custom` is not a cadence,
+it is the absence of one, and a minority of those series are plainly periodic.
+Measured against the first full Job A run: 1,163 `custom` series have live
+activity, 228 sit in the volume band with a breathing ladder, and **5** clear
+every screen filter except this one. Three of them survive the settlement
+source test too — `KXCBDECISIONMEXICO` (vol 21,103, breadth 0.905),
+`KXRAINMIAM` and `KXHMONTHRANGE`. Central bank decisions and monthly weather
+ranges are exactly the profile the instrument is hunting for.
+
+The fix does not guess. It reads a *second structural fact*: how many distinct
+events the series has already produced. A series with a real history of events
+recurs as a matter of record. `RECURRING_EVENT_FLOOR = 6` recovers all three
+candidates while reclassifying 931 series; a floor of 4 recovers the same three
+and touches 1,056. Reclassification alone changes nothing downstream — a series
+still has to pass benchmark, settlement source, volume band and breadth — so
+the floor cannot widen the screen on its own.
+
+`recurrence()` stays a pure function and keeps its old behaviour for any caller
+that does not supply `n_events`. Promoted rows are marked in `series_tags.notes`
+(`[recurrence from N events]`) so a reviewer can tell a recovered tag from a
+structural one.
+
+`RULES_VERSION` is now `rules:v2`, and Job D re-tags any unreviewed row whose
+stored `model` differs from the current version. Previously a rule change only
+reached series tagged after it, leaving everything else stale until somebody
+remembered `--recheck`.
+
+---
+
 ## Unresolved / carried forward
 
 - **U1 — RESOLVED by D26.** The `/historical/*` split is a retention boundary
@@ -470,5 +507,8 @@ weeks.
   outright — a passive seat paying maker fees is not the thing being screened for.
 - **U3 — exact fee schedule PDF** not diffed. §7 explicitly permits the
   approximation for v1; `fee_multiplier` (D10) closes the worst error.
-- **U4 — `frequency: "custom"`** covers 5,387 series and is genuinely ambiguous;
-  these are the only series where the classifier decides `recurrence`.
+- **U4 — RESOLVED by D33.** `frequency: "custom"` covers 5,393 series and is
+  ambiguous as a *label*, but not as a *record*: the number of events a series
+  has already produced settles it without guessing. Series below the floor
+  still land in `unknown`, so the ambiguity is narrowed rather than papered
+  over.
