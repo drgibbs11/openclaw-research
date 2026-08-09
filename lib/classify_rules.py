@@ -12,14 +12,17 @@ Measured against all 12,564 live series (see DISCREPANCIES D28):
     99.94% of series publish one.
   - `scrape_difficulty` follows from the same domain.
   - `benchmark` is the only real judgment call, and it collapses to a small
-    set of category + domain rules.
+    set of category + domain rules. It asks one question — is there a sharp
+    external book to be marked against? — so it enumerates the signals that
+    say *yes* and answers `none` once all of them have been checked. It does
+    not fall through to `unknown` for any category nobody thought to list,
+    which is what confined the screen to weather and economics (D34).
 
 Rules beat a model here: they are auditable, free, reproducible run to run, and
 they cannot hallucinate a settlement source that isn't in the payload. The cost
 is coarseness on `benchmark`, which is acceptable because the surviving
 candidate set is small enough to eyeball — `series_tags.reviewed` exists for
-exactly that, and anything the rules can't place lands in `unknown` rather than
-being quietly assigned.
+exactly that.
 
 CP5 ground truth: 52/53 real temperature series classify correctly. The single
 residual is KXHIGHTEMPDEN, whose frequency is `custom`.
@@ -29,7 +32,7 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-RULES_VERSION = "rules:v2"
+RULES_VERSION = "rules:v3"
 
 # --- settlement_source_type ------------------------------------------------
 # Structured numeric data you can poll and parse without a human in the loop.
@@ -37,6 +40,13 @@ NUMERIC = {
     "weather.gov", "noaa.gov", "weather.com", "cfbenchmarks.com",
     "fred.stlouisfed.org", "tradingeconomics.com", "coinmarketcap.com",
     "coingecko.com", "eia.gov",
+    # Published numeric charts. These are counts and ranks on a fixed schedule,
+    # not editorial picks — a scraper reads the number without a human in the
+    # loop, which is the whole test. billboard.com and luminatedata.com used to
+    # sit in SUBJECTIVE alongside the Oscars, which is what kept the entire
+    # music-charts complex out of the screen (D34).
+    "charts.youtube.com", "netflix.com", "kworb.net", "spotify.com",
+    "billboard.com", "luminatedata.com", "lmarena.ai",
 }
 # Scheduled institutional releases — parseable, but on the publisher's calendar.
 OFFICIAL = {
@@ -48,11 +58,14 @@ OFFICIAL = {
 MARKET = {
     "cmegroup.com", "nasdaq.com", "nyse.com", "tradingview.com",
     "marketwatch.com", "coinbase.com", "binance.com", "kraken.com",
+    # Settling to an exchange or an oracle price *is* settling to the
+    # benchmark. These carry the energy and metals ladders (D34).
+    "theice.com", "ice.com", "pyth.com", "pythdata.app",
 }
 # Human/committee decisions — no numeric feed exists at all.
 SUBJECTIVE = {
     "oscars.org", "theamas.com", "nobelprize.org", "emmys.com", "grammy.com",
-    "billboard.com", "luminatedata.com", "rottentomatoes.com", "metacritic.com",
+    "rottentomatoes.com", "metacritic.com", "time.com",
 }
 
 # --- scrape_difficulty -----------------------------------------------------
@@ -63,6 +76,9 @@ DIFFICULTY = {
     "bls.gov": "medium", "bea.gov": "medium", "census.gov": "medium",
     "eia.gov": "medium", "federalreserve.gov": "medium", "bts.gov": "medium",
     "nber.org": "high",
+    "charts.youtube.com": "low", "netflix.com": "low", "kworb.net": "low",
+    "spotify.com": "medium", "billboard.com": "medium",
+    "luminatedata.com": "high", "lmarena.ai": "low", "cdc.gov": "medium",
 }
 
 # Weather settles to an observation nobody trades a sharp book against. This is
@@ -139,12 +155,16 @@ def benchmark(series: dict) -> tuple[str, str | None]:
     category = series.get("category") or ""
     if hits(series, NO_BENCHMARK_DOMAINS):
         return "none", None
+    # Settling to a price feed means the feed is the benchmark, whatever the
+    # category says. Checked early because it is the strongest single signal.
+    if hits(series, MARKET):
+        return "cme_or_rates", "exchange / oracle price feed"
     if category == "Sports":
         return "sportsbook", "retail sportsbooks"
     if category == "Crypto" or hits(series, CRYPTO_DOMAINS):
         return "spot_crypto", "spot exchanges"
-    if category == "Financials":
-        return "cme_or_rates", "CME / rates futures"
+    if category in ("Financials", "Commodities"):
+        return "cme_or_rates", "CME / ICE futures"
     if category in ("Politics", "Elections"):
         # These are the markets Polymarket lists too, so there is a liquid
         # external book to be marked against.
@@ -155,7 +175,20 @@ def benchmark(series: dict) -> tuple[str, str | None]:
         if hits(series, RATES_DOMAINS):
             return "cme_or_rates", "fed funds futures"
         return "none", None
-    return "unknown", None
+    # Everything else. This used to return `unknown`, and since v_screen keeps
+    # only `benchmark = 'none'` that made the whole tail unreachable: no branch
+    # existed for Entertainment, Science and Technology, Health, Companies or
+    # anything else Kalshi lists, so 29 tradeable series were being dropped by
+    # fall-through rather than by judgment (D34).
+    #
+    # The question this field answers is "is there a sharp external book to be
+    # marked against?" Having checked every signal that would say yes, the
+    # honest answer is no. `unknown` is reserved for a payload that gives us
+    # nothing to reason from at all, which is the only case where the screen
+    # should decline to look.
+    if not category and not domains(series):
+        return "unknown", None
+    return "none", None
 
 
 def scrape_difficulty(series: dict) -> str:

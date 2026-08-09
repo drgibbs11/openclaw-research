@@ -494,6 +494,68 @@ remembered `--recheck`.
 
 ---
 
+## D34 — CRITICAL: the screen could only ever return weather and economics.
+
+`benchmark()` enumerated Sports, Crypto, Financials, Politics, Elections,
+Climate and Weather and Economics, then ended `return "unknown", None`.
+`v_screen` keeps only `benchmark = 'none'`, and only three branches could
+produce it — the weather domains, Climate and Weather, and non-rates
+Economics. **Every category nobody thought to name fell through to `unknown`
+and was silently dropped**, no matter how well it scored on every other filter.
+
+This is not a tuning issue. It made the instrument structurally incapable of
+answering the question it was built to ask. Of the 163 series that are
+recurring, in the volume band and carrying a live ladder:
+
+| category | verdict | n | vol24h | |
+|---|---|---:|---:|---|
+| Climate and Weather | `none` | 47 | 588k | kept |
+| Sports | `sportsbook` | 46 | 821k | correctly cut |
+| Entertainment | `unknown` | 17 | 257k | **cut by fall-through** |
+| Crypto | `spot_crypto` | 13 | 217k | correctly cut |
+| Economics | `none` | 12 | 180k | kept |
+| Commodities | `unknown` | 9 | 94k | **cut by fall-through** |
+| Politics | `other_liquid_market` | 8 | 50k | correctly cut |
+| Financials | `cme_or_rates` | 6 | 96k | correctly cut |
+| Science and Technology | `unknown` | 3 | 49k | **cut by fall-through** |
+
+47 + 12 ≈ the 56 that survived. The screen was reporting the answer it was
+built to be able to reach, which looked like a finding about Kalshi and was
+actually a finding about the rules.
+
+Adjudicating the 29 orphans rather than defaulting them:
+
+- **Commodities** settle to `theice.com` and Pyth — ICE futures and an oracle
+  price feed. Those *are* sharp benchmarks, so the exclusion was right and the
+  reasoning was absent. `MARKET` now carries those domains and is checked
+  early, since settling to a price feed makes that feed the benchmark whatever
+  the category says. `Commodities` also joins `Financials`.
+- **Entertainment and Science and Technology** mostly have no external book at
+  all: YouTube daily views, Netflix Top 10 ranks, Luminate album units,
+  Billboard chart position, Spotify monthly listeners, CDC measles counts,
+  LMArena model rankings. These are scrapable numbers on a schedule with
+  nobody quoting a sharp market against them — the exact profile in §1.
+- **Awards** (Oscars, Emmys, TIME) are genuine committee decisions. They stay
+  out via `committee_or_subjective`, which is the correct gate for them.
+
+`billboard.com` and `luminatedata.com` were also sitting in `SUBJECTIVE` next
+to the Oscars. A chart position is a published number, not a jury verdict, so
+they move to `NUMERIC`; `time.com` moves in the other direction, since Person
+of the Year is exactly a jury verdict.
+
+The fall-through is gone. `benchmark()` enumerates the signals that say a sharp
+book *exists* and answers `none` once all of them have been checked. `unknown`
+is now reserved for a payload with neither a category nor a settlement
+domain — the only case where the screen genuinely cannot reason.
+
+Measured effect: **56 candidates → 70, of which 21 are non-weather**, carrying
+~300k of daily volume that the screen previously could not see. CP5 ground
+truth is unaffected (39 temperature series, 0 misclassified), and every
+commodity and awards series verified still excluded. `RULES_VERSION` is
+`rules:v3`.
+
+---
+
 ## Unresolved / carried forward
 
 - **U1 — RESOLVED by D26.** The `/historical/*` split is a retention boundary

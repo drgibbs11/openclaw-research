@@ -314,12 +314,29 @@ same `<role>.<project_ref>` username form as `postgres`.
 Run order matters: **A → D → C**. Job D produces the candidate set that Job C
 scopes against, and Job C unscoped does not finish.
 
-The candidate set is **56 series** — the `BACKFILL_FROM_SCREEN` filters plus the
-three D33 recovers. It is overwhelmingly city temperature highs and lows
-(`KXHIGHT*`, `KXLOWT*`), rain, and monthly ranges: settle to `weather.gov`, no
-sharp external book to be marked against, and a ladder that actually trades.
-That is precisely the profile §1 describes, arrived at from live data rather
-than assumed. `screener-backfill` is configured against exactly this list.
+The candidate set is **70 series**, of which **21 are not weather** — see D34.
+The first pass returned 56 and was almost entirely city temperature ladders,
+which turned out to be a property of the rules rather than of Kalshi:
+`benchmark()` fell through to `unknown` for every category it did not
+explicitly name, and `v_screen` keeps only `benchmark = 'none'`, so nothing
+outside Climate and Weather and Economics could ever reach the screen.
+
+What that was hiding, by 24h volume:
+
+| series | vol24h | settles to |
+|---|---:|---|
+| `KXYTVIEWSW` — daily view count | 82,258 | `charts.youtube.com` |
+| `KXALBUMEQUIV` — album equivalent units | 35,641 | `luminatedata.com` |
+| `KXNETFLIXRANKSHOW` — Netflix TV rank | 22,203 | `netflix.com` |
+| `KXCBDECISIONMEXICO` — Banxico rate decision | 21,103 | (D33 recover) |
+| `KXNETFLIXRANKMOVIE` — Netflix movie rank | 17,261 | `netflix.com` |
+| `KXALBUMDEBUT` — album debuts at #1 | 12,975 | `billboard.com` |
+| `KXMEASLES` — measles cases | 8,705 | `cdc.gov` |
+| `KXTOPMODEL` — top model | 7,988 | `lmarena.ai` |
+
+Commodities (WTI, Brent, gold, silver) stay out, but now by judgment rather
+than by accident: they settle to ICE and to Pyth, which are sharp benchmarks.
+`screener-backfill` is configured against the 70.
 
 ## Storage
 
