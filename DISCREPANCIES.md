@@ -457,6 +457,105 @@ weeks.
 
 ---
 
+## D33 — `frequency: custom` was silently costing the screen real candidates.
+
+D9 reads `recurrence` straight off `series.frequency` and refuses to guess, so
+all 5,393 `custom` series land in `unknown`. `v_screen` requires
+`recurrence = 'recurring'`, which means every one of them is excluded — 43% of
+the live universe, dropped on the strength of a label the exchange declines to
+fill in.
+
+That is the right instinct and the wrong outcome. `custom` is not a cadence,
+it is the absence of one, and a minority of those series are plainly periodic.
+Measured against the first full Job A run: 1,163 `custom` series have live
+activity, 228 sit in the volume band with a breathing ladder, and **5** clear
+every screen filter except this one. Three of them survive the settlement
+source test too — `KXCBDECISIONMEXICO` (vol 21,103, breadth 0.905),
+`KXRAINMIAM` and `KXHMONTHRANGE`. Central bank decisions and monthly weather
+ranges are exactly the profile the instrument is hunting for.
+
+The fix does not guess. It reads a *second structural fact*: how many distinct
+events the series has already produced. A series with a real history of events
+recurs as a matter of record. `RECURRING_EVENT_FLOOR = 6` recovers all three
+candidates while reclassifying 931 series; a floor of 4 recovers the same three
+and touches 1,056. Reclassification alone changes nothing downstream — a series
+still has to pass benchmark, settlement source, volume band and breadth — so
+the floor cannot widen the screen on its own.
+
+`recurrence()` stays a pure function and keeps its old behaviour for any caller
+that does not supply `n_events`. Promoted rows are marked in `series_tags.notes`
+(`[recurrence from N events]`) so a reviewer can tell a recovered tag from a
+structural one.
+
+`RULES_VERSION` is now `rules:v2`, and Job D re-tags any unreviewed row whose
+stored `model` differs from the current version. Previously a rule change only
+reached series tagged after it, leaving everything else stale until somebody
+remembered `--recheck`.
+
+---
+
+## D34 — CRITICAL: the screen could only ever return weather and economics.
+
+`benchmark()` enumerated Sports, Crypto, Financials, Politics, Elections,
+Climate and Weather and Economics, then ended `return "unknown", None`.
+`v_screen` keeps only `benchmark = 'none'`, and only three branches could
+produce it — the weather domains, Climate and Weather, and non-rates
+Economics. **Every category nobody thought to name fell through to `unknown`
+and was silently dropped**, no matter how well it scored on every other filter.
+
+This is not a tuning issue. It made the instrument structurally incapable of
+answering the question it was built to ask. Of the 163 series that are
+recurring, in the volume band and carrying a live ladder:
+
+| category | verdict | n | vol24h | |
+|---|---|---:|---:|---|
+| Climate and Weather | `none` | 47 | 588k | kept |
+| Sports | `sportsbook` | 46 | 821k | correctly cut |
+| Entertainment | `unknown` | 17 | 257k | **cut by fall-through** |
+| Crypto | `spot_crypto` | 13 | 217k | correctly cut |
+| Economics | `none` | 12 | 180k | kept |
+| Commodities | `unknown` | 9 | 94k | **cut by fall-through** |
+| Politics | `other_liquid_market` | 8 | 50k | correctly cut |
+| Financials | `cme_or_rates` | 6 | 96k | correctly cut |
+| Science and Technology | `unknown` | 3 | 49k | **cut by fall-through** |
+
+47 + 12 ≈ the 56 that survived. The screen was reporting the answer it was
+built to be able to reach, which looked like a finding about Kalshi and was
+actually a finding about the rules.
+
+Adjudicating the 29 orphans rather than defaulting them:
+
+- **Commodities** settle to `theice.com` and Pyth — ICE futures and an oracle
+  price feed. Those *are* sharp benchmarks, so the exclusion was right and the
+  reasoning was absent. `MARKET` now carries those domains and is checked
+  early, since settling to a price feed makes that feed the benchmark whatever
+  the category says. `Commodities` also joins `Financials`.
+- **Entertainment and Science and Technology** mostly have no external book at
+  all: YouTube daily views, Netflix Top 10 ranks, Luminate album units,
+  Billboard chart position, Spotify monthly listeners, CDC measles counts,
+  LMArena model rankings. These are scrapable numbers on a schedule with
+  nobody quoting a sharp market against them — the exact profile in §1.
+- **Awards** (Oscars, Emmys, TIME) are genuine committee decisions. They stay
+  out via `committee_or_subjective`, which is the correct gate for them.
+
+`billboard.com` and `luminatedata.com` were also sitting in `SUBJECTIVE` next
+to the Oscars. A chart position is a published number, not a jury verdict, so
+they move to `NUMERIC`; `time.com` moves in the other direction, since Person
+of the Year is exactly a jury verdict.
+
+The fall-through is gone. `benchmark()` enumerates the signals that say a sharp
+book *exists* and answers `none` once all of them have been checked. `unknown`
+is now reserved for a payload with neither a category nor a settlement
+domain — the only case where the screen genuinely cannot reason.
+
+Measured effect: **56 candidates → 70, of which 21 are non-weather**, carrying
+~300k of daily volume that the screen previously could not see. CP5 ground
+truth is unaffected (39 temperature series, 0 misclassified), and every
+commodity and awards series verified still excluded. `RULES_VERSION` is
+`rules:v3`.
+
+---
+
 ## Unresolved / carried forward
 
 - **U1 — RESOLVED by D26.** The `/historical/*` split is a retention boundary
@@ -470,5 +569,8 @@ weeks.
   outright — a passive seat paying maker fees is not the thing being screened for.
 - **U3 — exact fee schedule PDF** not diffed. §7 explicitly permits the
   approximation for v1; `fee_multiplier` (D10) closes the worst error.
-- **U4 — `frequency: "custom"`** covers 5,387 series and is genuinely ambiguous;
-  these are the only series where the classifier decides `recurrence`.
+- **U4 — RESOLVED by D33.** `frequency: "custom"` covers 5,393 series and is
+  ambiguous as a *label*, but not as a *record*: the number of events a series
+  has already produced settles it without guessing. Series below the floor
+  still land in `unknown`, so the ambiguity is narrowed rather than papered
+  over.

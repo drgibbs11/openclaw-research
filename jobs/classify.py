@@ -46,11 +46,25 @@ def candidates(conn, classify_all: bool, recheck: bool) -> list[dict]:
                       where mt.series_ticker = s.series_ticker)
     """
     # A reviewed row is a human decision and always wins over the rules.
-    untagged = "and t.series_ticker is null" if not recheck else \
-               "and (t.series_ticker is null or t.reviewed is not true)"
+    params: list = []
+    if recheck:
+        untagged = "and (t.series_ticker is null or t.reviewed is not true)"
+    else:
+        # Rows written by an older rules version are re-tagged automatically.
+        # Without this a rule change (D33 bumped RULES_VERSION to rules:v2)
+        # only reaches series tagged *after* the change, and the rest sit stale
+        # until somebody remembers to pass --recheck by hand.
+        untagged = ("and (t.series_ticker is null or "
+                    "(t.reviewed is not true "
+                    " and coalesce(t.model, '') <> %s))")
+        params.append(classify_rules.RULES_VERSION)
+
+    # n_events is what lets a `custom` series be recognised as recurring (D33).
     sql = f"""
         select s.series_ticker, s.title, s.category, s.frequency,
-               s.settlement_sources
+               s.settlement_sources,
+               (select count(*) from events e
+                 where e.series_ticker = s.series_ticker) as n_events
         from series s
         left join series_tags t using (series_ticker)
         where coalesce(s.frequency, '') <> 'one_off'
@@ -59,7 +73,7 @@ def candidates(conn, classify_all: bool, recheck: bool) -> list[dict]:
         order by s.series_ticker
     """
     with conn.cursor() as cur:
-        cur.execute(sql)
+        cur.execute(sql, params)
         cols = [d[0] for d in cur.description]
         return [dict(zip(cols, r)) for r in cur.fetchall()]
 
