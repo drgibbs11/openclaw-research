@@ -5,8 +5,8 @@
 -- the T-60 opening book of every ladder that opens at 00/06/12/18Z, and
 -- market_taker_stats holds the per-ticker aggregate this tape must reproduce.
 --
--- Nothing here touches the mlb_* tables, loaders or modules. There is no
--- dependency on them in any direction.
+-- This phase is self-contained inside the screener schema: no table, loader or
+-- module outside it is imported, referenced or copied in any direction.
 
 set search_path to screener;
 
