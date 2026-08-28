@@ -232,6 +232,35 @@ class KalshiClient:
             if not m.get("mve_collection_ticker"):
                 yield m
 
+    def historical_cutoff(self) -> dict:
+        """The live/historical boundary timestamps.
+
+        `market_settled_ts` is the one that matters here: a market that settled
+        before it is served only by the /historical/* endpoints. Fetched rather
+        than hardcoded because it moves — it read 2026-06-29T00:00:00Z when
+        this was written, and a stale constant would silently send every
+        request to the wrong endpoint.
+        """
+        return self.get("/historical/cutoff")
+
+    def candlesticks(self, ticker: str, series_ticker: str,
+                     start_ts: int, end_ts: int, period_interval: int = 1,
+                     historical: bool = False) -> list[dict]:
+        """1-minute candles for one market over [start_ts, end_ts].
+
+        start_ts/end_ts/period_interval are all REQUIRED by both endpoints —
+        omitting any of them is a 400, not a default.
+
+        The two endpoints do not agree on field names (D38); lib.hourly
+        normalises. They also differ in shape: the live one is nested under the
+        series, the historical one is not.
+        """
+        path = (f"/historical/markets/{ticker}/candlesticks" if historical
+                else f"/series/{series_ticker}/markets/{ticker}/candlesticks")
+        body = self.get(path, {"start_ts": start_ts, "end_ts": end_ts,
+                               "period_interval": period_interval})
+        return body.get("candlesticks") or []
+
     def iter_trades(self, ticker: str, historical: bool = False,
                     max_pages: int | None = None, **params) -> Iterator[tuple[dict, int]]:
         """Public tape. D11: block trades excluded — they are negotiated

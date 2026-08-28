@@ -38,6 +38,10 @@ def sweep(conn, client: KalshiClient, since: datetime, page_cap: int) -> tuple[i
     ev_map = event_series_map(conn)
     fee_mults = tape.fee_multipliers(conn)
     done = tape.existing_stats(conn)
+    # Series flagged persist_trades keep their raw fills as well as the
+    # aggregate, so the hourly tape keeps growing after the one-time backfill
+    # without a second job reading the same tapes again.
+    persist = tape.persist_series(conn)
 
     min_settled_ts = int(since.timestamp())  # D6: unix seconds
     markets, batch, ingested, skipped_novol = [], [], 0, 0
@@ -101,7 +105,8 @@ def sweep(conn, client: KalshiClient, since: datetime, page_cap: int) -> tuple[i
     for m in markets:
         if m["ticker"] in done:
             continue
-        st = tape.process_market(conn, client, m, fee_mults, page_cap)
+        st = tape.process_market(conn, client, m, fee_mults, page_cap,
+                                 persist=persist)
         aggregated += 1
         if aggregated % 25 == 0:
             conn.commit()

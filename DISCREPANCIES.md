@@ -668,3 +668,67 @@ within ~80 seconds and the job fails loudly like every other error path.
 Job C is resumable — `pending_markets()` skips anything already in
 `market_taker_stats` — so the recovery is a redeploy, and the cost of the stall
 was wall-clock only.
+
+---
+
+## Hourly temperature markets (KXTEMP*H), phase 1 — 2026-08-28
+
+**D37 — `market_trades.price_cents` is NUMERIC, not INT.**
+The build spec says "Cents integers". 1,099 KXTEMPNYCH markets between
+2026-03-24 and 2026-03-30 are `tapered_deci_cent` and quote in tenths of a
+cent, so an integer column would silently round 1.6% of the tape — and those
+are exactly the tickers CP4's 1% PnL reproduction would then fail on, with no
+way to tell rounding from a real disagreement. Numeric is strictly wider: every
+`linear_cent` market still stores whole cents. The same reasoning applies to
+the cents columns on `market_candles_1m`.
+
+**D38 — the live and historical candlestick endpoints use different field
+names for the same data.** Verified on both, same market shape:
+
+| | live `/series/{s}/markets/{t}/candlesticks` | historical `/historical/markets/{t}/candlesticks` |
+|---|---|---|
+| bid/ask OHLC | `open_dollars`, `close_dollars`, … | `open`, `close`, … |
+| traded price | `price.close_dollars` | `price.close` |
+| volume | `volume_fp` | `volume` |
+| open interest | `open_interest_fp` | `open_interest` |
+
+Reading the historical endpoint with the live names does **not** error: every
+price parses to None and the loader writes a full set of NULL-priced rows that
+look like a market nobody quoted. `lib/hourly.py:candle_row` accepts either
+spelling, and `jobs/hourly_candles_backfill.py` logs the live/historical split
+so a silent all-NULL load is visible in the run output.
+
+**D39 — candlestick `start_ts`, `end_ts` and `period_interval` are all
+required.** Omitting any of them is a 400, on both endpoints. The build spec's
+sketch (`?period_interval=1`) would never have returned a row.
+
+**D40 — endpoint choice is governed by `GET /historical/cutoff`, which moves.**
+`market_settled_ts` read `2026-06-29T00:00:00Z` when this was written. Markets
+settling before it are served ONLY by the `/historical/*` endpoints. The value
+is fetched at job start rather than hardcoded.
+
+**D41 — `markets_terminal` has a seven-week hole in KXTEMPNYCH.**
+Nothing settles between 2026-06-06 02:00Z and 2026-07-25 12:00Z. Job B is
+high-water-mark driven and only moves forward, so a window it was not running
+for is never revisited. The hole swallows all three CP2 reference events. The
+markets are still retrievable from the live `/markets` endpoint (they settled
+after the cutoff), which accepts `min_close_ts`/`max_close_ts` and reached
+2026-07-03 in testing — hence `jobs/hourly_markets_gap.py`.
+
+**D42 — screener tables must NOT be registered in `public.retention_policy`.**
+`public.downsample_table` interpolates the policy's `table_name` with
+`format(... %I ...)`, which quotes the whole string as ONE identifier: a row
+naming `screener.market_trades` becomes `"screener.market_trades"`, a table of
+that literal name. Its `search_path` is also pinned to `pg_catalog, public`, so
+an unqualified screener table cannot resolve either. `public.run_retention`
+wraps each table in its own exception block, so such a row would not break
+retention for the live weather tables — it would report an error every night
+forever while pruning nothing. Screener retention stays in pg_cron, alongside
+the existing `screener-prune-snapshots`.
+
+**D43 — the candlestick API is already sparse, but not change-only.**
+A 60-minute market returned 26 candles, not 60. It omits some minutes on its
+own, yet still returns quiet minutes whose quotes are unchanged, so the
+change-only filter in `lib/hourly.py:is_change_row` is applied on top rather
+than assumed. The first row of each market is always kept: it is the T-60
+opening book that CP5 reconciles against `market_snapshots`.

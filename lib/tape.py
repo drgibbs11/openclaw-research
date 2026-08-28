@@ -125,21 +125,84 @@ def store_stats(conn, ticker: str, st) -> None:
     db.upsert(conn, "market_taker_stats", [row], conflict="ticker")
 
 
+def persist_series(conn) -> set[str]:
+    """Series whose per-trade tape is kept, not just aggregated."""
+    with conn.cursor() as cur:
+        cur.execute("select series_ticker from series where persist_trades")
+        return {r[0] for r in cur.fetchall()}
+
+
+def store_trades(conn, ticker: str, series_ticker: str | None,
+                 trades: list[dict]) -> int:
+    """Write raw fills to market_trades. Idempotent on the trade id (G3).
+
+    A re-run writes nothing new, which is what makes the backfill resumable at
+    market granularity without tracking which markets it already did.
+    """
+    from .hourly import trade_row
+
+    rows = [r for r in (trade_row(t, series_ticker) for t in trades) if r]
+    if not rows:
+        return 0
+    return db.upsert(conn, "market_trades", rows,
+                     conflict="kalshi_trade_id", update_cols=[])
+
+
+def collect_trades(client: KalshiClient, ticker: str,
+                   page_cap: int = DEFAULT_PAGE_CAP,
+                   historical: bool = False) -> tuple[list[dict], int]:
+    """The tape as a list, plus the highest page index reached.
+
+    The page index comes back because the caller has to know whether it hit
+    the cap: a truncated tape that reports truncated=False would look like a
+    complete one, and CP4 compares this tape against an aggregate that knows
+    it was truncated.
+    """
+    trades, pages = [], 0
+    for t, page in client.iter_trades(ticker, historical=historical,
+                                      max_pages=page_cap):
+        trades.append(t)
+        pages = max(pages, page + 1)
+    return trades, pages
+
+
 def process_market(conn, client: KalshiClient, market: dict, fee_mult_by_series: dict,
-                   page_cap: int = DEFAULT_PAGE_CAP) -> object:
+                   page_cap: int = DEFAULT_PAGE_CAP,
+                   persist: set[str] | None = None) -> object:
     """Aggregate one terminal market's tape and persist it.
 
     D13: markets whose live tape comes back empty are retried against
     /historical/trades — the cutover age between the two endpoints is
     undocumented (U1), so we discover it empirically rather than assume it.
+
+    When the market's series is in `persist`, the fills are also written to
+    market_trades. The tape is read ONCE and used for both: aggregating from
+    one list and persisting from a second read would double the request cost
+    and could disagree if a fill landed between the two.
     """
     ticker = market["ticker"]
     result = market.get("result")
-    mult = fee_mult_by_series.get(market.get("series_ticker"))
+    series = market.get("series_ticker")
+    mult = fee_mult_by_series.get(series)
+    keep = bool(persist) and series in persist
 
-    st = compute_stats(client, ticker, result, mult, page_cap)
-    if st.trades == 0:
-        st = compute_stats(client, ticker, result, mult, page_cap, historical=True)
+    if not keep:
+        st = compute_stats(client, ticker, result, mult, page_cap)
+        if st.trades == 0:
+            st = compute_stats(client, ticker, result, mult, page_cap, historical=True)
+        store_stats(conn, ticker, st)
+        return st
 
+    trades, pages = collect_trades(client, ticker, page_cap)
+    if not trades:
+        trades, pages = collect_trades(client, ticker, page_cap, historical=True)
+
+    # Fold the same list the rows come from, so market_taker_stats and
+    # market_trades can never describe different tapes (CP4). Page indices are
+    # replayed so pages_read/truncated stay honest.
+    st = aggregate(((t, max(pages - 1, 0)) for t in trades), result, mult)
+    st.pages_read = pages
+    st.truncated = pages >= page_cap
+    store_trades(conn, ticker, series, trades)
     store_stats(conn, ticker, st)
     return st
