@@ -36,6 +36,20 @@ from lib.kalshi import KalshiClient  # noqa: E402
 
 log = logging.getLogger("hourly_candles_backfill")
 JOB = "hourly_candles_backfill"
+# A storage guard, not a completion condition. It exists so an unbounded walk
+# cannot fill the database before anyone notices; it does NOT mean the backfill
+# is finished when it trips.
+#
+# 2026-08-31: it tripped at 1,000,015 rows with 2,973 markets still to go, and
+# from the database side that was indistinguishable from a crash -- the cursor
+# stopped advancing, updated_at froze, and the one warning explaining why went
+# to a Railway log nobody was reading. It cost a day and a wrong diagnosis
+# ("Job B stalled"). The stop reason is now written into job_state.notes, so
+# whoever next reads the cursor sees WHY it stopped without needing the logs.
+#
+# For reference: at 224 bytes/row and ~12.3 rows per market, the five hourly
+# series cost about 8 MB per 3,000 markets. The cap is a long way from binding
+# on cost; raise HOURLY_MAX_CANDLE_ROWS rather than assume it means "done".
 MAX_ROWS = int(os.environ.get("HOURLY_MAX_CANDLE_ROWS", "1000000"))
 COMMIT_EVERY = 100
 OVERLAP = timedelta(hours=1)
@@ -120,9 +134,13 @@ def main() -> int:
         done = n_hist = n_live = 0
         last_close = None
 
+        stopped = None
         for ticker, series, open_time, close_time in markets:
             if stored >= MAX_ROWS:
-                log.warning("cap reached: %d candle rows, stopping", stored)
+                stopped = "row_cap"
+                log.warning("cap reached: %d candle rows, %d market(s) unprocessed, "
+                            "stopping -- raise HOURLY_MAX_CANDLE_ROWS to finish",
+                            stored, len(markets) - done)
                 break
             historical = close_time < cutoff
             try:
@@ -141,15 +159,22 @@ def main() -> int:
             if done % COMMIT_EVERY == 0:
                 conn.commit()
                 db.set_job_cursor(conn, JOB, cursor_ts=last_close,
-                                  notes={"markets": done, "rows": stored})
+                                  notes={"markets": done, "rows": stored,
+                                         "remaining": len(markets) - done,
+                                         "stopped": None})
                 conn.commit()
                 log.info("%d/%d markets, %d rows (last %s)",
                          done, len(markets), stored, ticker)
 
         conn.commit()
         if last_close is not None:
+            # `stopped` is the difference between "finished the worklist" and
+            # "hit the guard". A reader of job_state must not have to infer it
+            # from a frozen cursor.
             db.set_job_cursor(conn, JOB, cursor_ts=last_close,
-                              notes={"markets": done, "rows": stored})
+                              notes={"markets": done, "rows": stored,
+                                     "remaining": len(markets) - done,
+                                     "stopped": stopped or "worklist_complete"})
         final = candles_stored(conn)
 
     log.info("done: %d markets (%d historical, %d live), %d rows, %d requests",
