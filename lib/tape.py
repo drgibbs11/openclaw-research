@@ -68,6 +68,11 @@ def resolve_missing_events(conn, client: KalshiClient, event_tickers,
         cur.execute("select event_ticker from events where event_ticker = any(%s)",
                     (list(wanted),))
         known = {r[0] for r in cur.fetchall()}
+    # End the read transaction before up to `cap` API calls, so the session is
+    # not left idle in transaction (screener_app has
+    # idle_in_transaction_session_timeout = 10min). Only Job B calls this.
+    if not conn.autocommit:
+        conn.commit()
 
     missing = sorted(wanted - known)
     if len(missing) > cap:

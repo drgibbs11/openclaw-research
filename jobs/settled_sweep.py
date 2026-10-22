@@ -237,6 +237,7 @@ def sweep_chunk(conn, client: KalshiClient, lo: datetime, hi: datetime, page_cap
     """One settlement-time window. Same logic as the original single-pass sweep."""
     ev_map = event_series_map(conn)
     fee_mults = tape.fee_multipliers(conn)
+    conn.commit()  # never sit idle in transaction across API calls
     WATCHDOG.touch(f"{label} loaded maps")
 
     markets, batch, ingested, skipped_novol = [], [], 0, 0
@@ -280,6 +281,7 @@ def sweep_chunk(conn, client: KalshiClient, lo: datetime, hi: datetime, page_cap
 
     if repaired:
         ev_map = event_series_map(conn)
+        conn.commit()
         for m in markets:
             if not m["series_ticker"]:
                 m["series_ticker"] = ev_map.get(m["event_ticker"])
@@ -292,15 +294,21 @@ def sweep_chunk(conn, client: KalshiClient, lo: datetime, hi: datetime, page_cap
 
     aggregated = 0
     pending: list[str] = []
+    last_commit = time.monotonic()
     for m in todo:
         st = tape.process_market(conn, client, m, fee_mults, page_cap)
         aggregated += 1
         pending.append(m["ticker"])
         WATCHDOG.touch(f"{label} aggregated {m['ticker']}")
-        if aggregated % 25 == 0:
+        # Commit every 25 markets as before, and also whenever 60s have passed,
+        # so slow (throttled or long) tapes never leave the session idle in
+        # transaction for long.
+        if aggregated % 25 == 0 or time.monotonic() - last_commit > 60:
             conn.commit()
+            last_commit = time.monotonic()
             done.update(pending)
             pending = []
+        if aggregated % 25 == 0:
             log.info("%s aggregated %d/%d (last: %s, %d trades)",
                      label, aggregated, len(todo), m["ticker"], st.trades)
     conn.commit()
@@ -318,6 +326,7 @@ def run(page_cap: int) -> int:
         cursor_ts, _ = db.get_job_cursor(conn, JOB)
         since = (cursor_ts - OVERLAP) if cursor_ts else started - timedelta(days=LOOKBACK_DEFAULT_DAYS)
         done = tape.existing_stats(conn)
+        conn.commit()
     except Exception as exc:
         c.close(exc)
         raise
