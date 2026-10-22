@@ -60,9 +60,17 @@ CONNECT_KWARGS = {
 
 
 @contextmanager
-def connect(autocommit: bool = False):
+def connect(autocommit: bool = False, extra_kwargs: dict | None = None):
+    """Open a screener connection.
+
+    `extra_kwargs` are merged over CONNECT_KWARGS for this connection only.
+    Default None keeps every existing caller's behaviour byte-for-byte; the
+    settled sweep uses it to add tcp_user_timeout and a client statement_timeout
+    without changing what the snapshot, classify, prune or backfill jobs send.
+    """
+    kwargs = {**CONNECT_KWARGS, **(extra_kwargs or {})}
     conn = psycopg.connect(dsn(), prepare_threshold=None, autocommit=autocommit,
-                           **CONNECT_KWARGS)
+                           **kwargs)
     try:
         with conn.cursor() as cur:
             cur.execute(f"set search_path to {SCHEMA}")
