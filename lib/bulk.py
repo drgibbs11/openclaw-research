@@ -110,3 +110,64 @@ def upsert_changed(conn, table: str, rows: Sequence[dict], conflict: str,
             stats["updated"] += len(res) - ins
             stats["unchanged"] += len(page) - len(res)
     return stats
+
+
+# ---------------------------------------------------------------- market_snapshots (DB sweep #4, 2026-11-20)
+SNAPSHOT_COLS = [
+    ("ticker", "text"), ("run_ts", "timestamptz"), ("series_ticker", "text"), ("event_ticker", "text"),
+    ("status", "text"), ("yes_bid", "numeric"), ("yes_ask", "numeric"), ("no_bid", "numeric"), ("no_ask", "numeric"),
+    ("last_price", "numeric"), ("volume", "numeric"), ("volume_24h", "numeric"), ("open_interest", "numeric"),
+    ("liquidity", "numeric"), ("price_level_structure", "text"), ("close_time", "timestamptz"),
+]
+SNAPSHOT_KEY = ["ticker", "run_ts"]
+
+
+def build_snapshot_sql(skip_unchanged: bool) -> psql.Composed:
+    """ONE statement per page: insert ... select from unnest(typed arrays). With skip_unchanged, a market whose
+    newest stored snapshot inside the refresh window (%s hours) has identical values is not written again.
+    Same-minute re-runs still overwrite (on conflict (ticker, run_ts) do update), as before."""
+    cols = [c for c, _ in SNAPSHOT_COLS]
+    ident = lambda c: psql.Identifier(c)
+    arrays = psql.SQL(", ").join(psql.SQL("%s::" + t + "[]") for _, t in SNAPSHOT_COLS)
+    compare = [c for c in cols if c not in SNAPSHOT_KEY]
+    where = psql.SQL("")
+    if skip_unchanged:
+        where = psql.SQL(
+            " where not exists (select 1 from (select * from market_snapshots p where p.ticker = v.ticker"
+            " and p.run_ts < v.run_ts and p.run_ts > v.run_ts - %s::float8 * interval '1 hour'"
+            " order by p.run_ts desc limit 1) last where ({lc}) is not distinct from ({vc}))"
+        ).format(lc=psql.SQL(", ").join(psql.SQL("last.{}").format(ident(c)) for c in compare),
+                 vc=psql.SQL(", ").join(psql.SQL("v.{}").format(ident(c)) for c in compare))
+    return psql.SQL(
+        "insert into market_snapshots ({cols}) select {vcols} from unnest({arrays}) as v({cols}){where} "
+        "on conflict (ticker, run_ts) do update set {sets}"
+    ).format(cols=psql.SQL(", ").join(map(ident, cols)),
+             vcols=psql.SQL(", ").join(psql.SQL("v.{}").format(ident(c)) for c in cols),
+             arrays=arrays, where=where,
+             sets=psql.SQL(", ").join(psql.SQL("{c} = excluded.{c}").format(c=ident(c)) for c in compare))
+
+
+def _coerce(t: str, v):
+    if v is None:
+        return None
+    if t == "numeric":
+        from decimal import Decimal
+        return v if isinstance(v, Decimal) else Decimal(str(v))
+    return v
+
+
+def insert_snapshots(conn, rows: Sequence[dict], skip_unchanged_hours: float = 0) -> dict:
+    """Write one page of market_snapshots rows as ONE statement (was executemany: one statement per row).
+    skip_unchanged_hours > 0: skip markets whose newest snapshot in that many hours is identical, so every
+    market still gets a fresh row at least every `skip_unchanged_hours` (keep it < 24 h: v_latest_snapshot
+    only looks back 24 h). Returns {"sent": n, "written": m, "skipped": n - m}."""
+    rows = _dedupe(rows, SNAPSHOT_KEY)
+    if not rows:
+        return {"sent": 0, "written": 0, "skipped": 0}
+    arrays = [[_coerce(t, r.get(c)) for r in rows] for c, t in SNAPSHOT_COLS]
+    skip = skip_unchanged_hours and skip_unchanged_hours > 0
+    params = arrays + ([float(skip_unchanged_hours)] if skip else [])
+    with conn.cursor() as cur:
+        cur.execute(build_snapshot_sql(bool(skip)), params)
+        written = cur.rowcount if cur.rowcount is not None and cur.rowcount >= 0 else len(rows)
+    return {"sent": len(rows), "written": written, "skipped": len(rows) - written}

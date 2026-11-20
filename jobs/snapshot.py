@@ -13,12 +13,19 @@ VALUES, 500/page, DO UPDATE only when a column actually changed or last_seen is
 holds one transaction open or rewrites ~900k unchanged rows. Market -> series
 linkage looks up only the event tickers in each market page (index-only scan on
 ev_ticker_series_cov, sql/040) instead of loading the whole events table.
-The market_snapshots phase is unchanged and still one transaction.
+The market_snapshots phase is still one transaction.
+
+2026-11-20 DB sweep #4 (Chris-approved): market_snapshots pages are written as ONE multi-row statement each
+(lib.bulk.insert_snapshots; was one INSERT per row via executemany, ~200k statements a run), and a market whose
+newest snapshot in the last SNAPSHOT_REFRESH_HOURS (default 12) has identical values is skipped, so unchanged
+long-tail markets get a row every 12 h instead of every 6 h. 12 h < the 24 h window of v_latest_snapshot, so the
+screen still sees every open market even if one run is missed. SNAPSHOT_REFRESH_HOURS=0 writes every row again.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from datetime import datetime, timezone
 
@@ -29,6 +36,7 @@ from lib.kalshi import KalshiClient, RateLimited  # noqa: E402
 
 log = logging.getLogger("snapshot")
 BATCH = 500
+REFRESH_HOURS = float(os.environ.get("SNAPSHOT_REFRESH_HOURS", "12"))
 
 
 def sync_series(conn, client: KalshiClient, now: datetime) -> int:
@@ -118,6 +126,7 @@ def lookup_series(conn, event_tickers, cache: dict) -> None:
 def snapshot_markets(conn, client: KalshiClient, run_ts: datetime) -> int:
     ev_cache: dict[str, str | None] = {}
     total, batch, unmapped = 0, [], 0
+    stats = {"written": 0, "skipped": 0}
 
     def flush(markets: list[dict]) -> int:
         nonlocal unmapped
@@ -128,7 +137,9 @@ def snapshot_markets(conn, client: KalshiClient, run_ts: datetime) -> int:
             if st is None:
                 unmapped += 1
             rows.append(mappers.snapshot_row(m, run_ts, st))
-        return db.upsert(conn, "market_snapshots", rows, conflict="ticker, run_ts")
+        res = bulk.insert_snapshots(conn, rows, skip_unchanged_hours=REFRESH_HOURS)
+        stats["written"] += res["written"]; stats["skipped"] += res["skipped"]
+        return res["sent"]
 
     # D8: mve_filter=exclude — combo markets are not screenable series.
     for m in client.iter_markets(status="open"):
@@ -141,7 +152,8 @@ def snapshot_markets(conn, client: KalshiClient, run_ts: datetime) -> int:
     if batch:
         total += flush(batch)
 
-    log.info("snapshots written: %d (unmapped series: %d)", total, unmapped)
+    log.info("snapshots: %d open markets, %d rows written, %d unchanged skipped (refresh %sh; unmapped series: %d)",
+             total, stats["written"], stats["skipped"], REFRESH_HOURS, unmapped)
     return total
 
 

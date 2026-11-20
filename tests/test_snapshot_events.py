@@ -197,3 +197,28 @@ def test_sync_events_then_snapshot_markets_maps_series(pg, monkeypatch):
     pg.commit()
     got = dict(pg.execute("select ticker, series_ticker from market_snapshots").fetchall())
     assert n == 5 and got == {"M1": "S1", "M2": "S2", "M3": None, "M4": None, "M5": "S1"}
+
+
+def test_snapshot_sql_is_one_statement_with_change_skip():
+    from psycopg import sql as _s
+    q = bulk.build_snapshot_sql(True).as_string(None) if hasattr(bulk.build_snapshot_sql(True), "as_string") else ""
+    assert q.count("insert into") == 1 and "unnest(" in q and "is not distinct from" in q
+    assert "on conflict (\"ticker\", \"run_ts\") do update" in q or 'on conflict (ticker, run_ts) do update' in q
+    assert q.count("%s") == len(bulk.SNAPSHOT_COLS) + 1
+    q0 = bulk.build_snapshot_sql(False).as_string(None)
+    assert "not exists" not in q0 and q0.count("%s") == len(bulk.SNAPSHOT_COLS)
+
+
+def test_insert_snapshots_one_execute_per_page():
+    calls = []
+    class Cur:
+        rowcount = 2
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, q, p): calls.append(p)
+    class Conn:
+        def cursor(self): return Cur()
+    rows = [{"ticker": t, "run_ts": 1, "yes_bid": 0.5} for t in ("A", "B", "B", "C")]
+    st = bulk.insert_snapshots(Conn(), rows, 12)
+    assert len(calls) == 1 and st == {"sent": 3, "written": 2, "skipped": 1}
+    assert calls[0][-1] == 12.0 and calls[0][0] == ["A", "B", "C"]
